@@ -23,7 +23,7 @@ TINY_BASE_URL = "https://api.tiny.com.br/api2"
 app = FastAPI(
     title="MHM Dashboard Tiny API",
     description="Backend online para dashboard MHM com Tiny/Olist, Supabase e Lovable.",
-    version="1.0.0",
+    version="1.0.1",
 )
 
 
@@ -409,7 +409,12 @@ def obter_estoque_tiny(id_produto: str) -> Optional[Dict[str, Any]]:
 # CÁLCULO DE RANKING
 # =========================
 
-def calcular_rankings(data_inicial: str, data_final: str, max_paginas: int = 10) -> Dict[str, Any]:
+def calcular_rankings(
+    data_inicial: str,
+    data_final: str,
+    max_paginas: int = 10
+) -> Dict[str, Any]:
+
     pedidos_resumidos = pesquisar_pedidos_tiny(
         data_inicial_iso=data_inicial,
         data_final_iso=data_final,
@@ -422,6 +427,7 @@ def calcular_rankings(data_inicial: str, data_final: str, max_paginas: int = 10)
         "nome_produto": "",
         "quantidade_vendida": 0.0,
         "valor_total_vendido": 0.0,
+        "percentual_participacao": 0.0,
         "pedidos_count": 0
     })
 
@@ -458,7 +464,10 @@ def calcular_rankings(data_inicial: str, data_final: str, max_paginas: int = 10)
             # Se vier em DD/MM/YYYY, converte para YYYY-MM-DD
             if isinstance(data_pedido, str) and "/" in data_pedido:
                 try:
-                    data_pedido = datetime.strptime(data_pedido, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    data_pedido = datetime.strptime(
+                        data_pedido,
+                        "%d/%m/%Y"
+                    ).strftime("%Y-%m-%d")
                 except Exception:
                     data_pedido = data_final
 
@@ -518,6 +527,15 @@ def calcular_rankings(data_inicial: str, data_final: str, max_paginas: int = 10)
     for produto in produtos.values():
         produto["quantidade_vendida"] = round(produto["quantidade_vendida"], 3)
         produto["valor_total_vendido"] = round(produto["valor_total_vendido"], 2)
+
+        if faturamento_total > 0:
+            produto["percentual_participacao"] = round(
+                (produto["valor_total_vendido"] / faturamento_total) * 100,
+                2
+            )
+        else:
+            produto["percentual_participacao"] = 0.0
+
         lista_produtos.append(produto)
 
     ranking_quantidade = sorted(
@@ -536,6 +554,7 @@ def calcular_rankings(data_inicial: str, data_final: str, max_paginas: int = 10)
         produto["posicao_quantidade"] = index
 
     mapa_posicao_valor = {}
+
     for index, produto in enumerate(ranking_valor, start=1):
         chave = produto["tiny_produto_id"] or produto["sku"] or produto["nome_produto"]
         mapa_posicao_valor[chave] = index
@@ -583,7 +602,6 @@ def salvar_sync_supabase(resultado: Dict[str, Any]) -> Dict[str, Any]:
             on_conflict="tiny_id"
         )
 
-    # Para evitar duplicar itens do mesmo período, apagamos itens daquele período antes de salvar.
     data_inicial = resultado["periodo"]["data_inicial"]
     data_final = resultado["periodo"]["data_final"]
 
@@ -620,6 +638,7 @@ def salvar_ranking_diario(data_ranking: str, produtos: List[Dict[str, Any]]) -> 
             "nome_produto": produto.get("nome_produto"),
             "quantidade_vendida": produto.get("quantidade_vendida", 0),
             "valor_total_vendido": produto.get("valor_total_vendido", 0),
+            "percentual_participacao": produto.get("percentual_participacao", 0),
             "pedidos_count": produto.get("pedidos_count", 0),
             "posicao_quantidade": produto.get("posicao_quantidade"),
             "posicao_valor": produto.get("posicao_valor")
@@ -652,6 +671,7 @@ def salvar_ranking_mensal(data_referencia: str, produtos: List[Dict[str, Any]]) 
             "nome_produto": produto.get("nome_produto"),
             "quantidade_vendida": produto.get("quantidade_vendida", 0),
             "valor_total_vendido": produto.get("valor_total_vendido", 0),
+            "percentual_participacao": produto.get("percentual_participacao", 0),
             "pedidos_count": produto.get("pedidos_count", 0),
             "posicao_quantidade": produto.get("posicao_quantidade"),
             "posicao_valor": produto.get("posicao_valor")
@@ -672,15 +692,18 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "versao": "1.0.0",
+        "versao": "1.0.1",
         "rotas": [
             "/health",
             "/teste/tiny-pedidos",
+            "/teste/supabase",
             "/dashboard/top-dia",
             "/dashboard/top-mes",
             "/dashboard/periodo",
             "/sync/tiny-dia",
-            "/sync/tiny-mes"
+            "/sync/tiny-mes",
+            "/db/ranking-diario",
+            "/db/ranking-mensal"
         ]
     }
 
