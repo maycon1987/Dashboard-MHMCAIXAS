@@ -23,7 +23,7 @@ TINY_BASE_URL = "https://api.tiny.com.br/api2"
 app = FastAPI(
     title="MHM Dashboard Tiny API",
     description="Backend online para dashboard MHM com Tiny/Olist, Supabase e Lovable.",
-    version="1.0.1",
+    version="1.0.2",
 )
 
 
@@ -54,10 +54,6 @@ def inicio_mes_iso() -> str:
 
 
 def formatar_data_br(data_iso: str) -> str:
-    """
-    Tiny API V2 usa data em formato DD/MM/YYYY.
-    Entrada da nossa API: YYYY-MM-DD.
-    """
     try:
         dt = datetime.strptime(data_iso, "%Y-%m-%d")
         return dt.strftime("%d/%m/%Y")
@@ -132,7 +128,6 @@ def supabase_insert(
     verificar_supabase()
 
     url = f"{SUPABASE_URL}/rest/v1/{tabela}"
-
     headers = supabase_headers()
 
     if on_conflict:
@@ -306,8 +301,26 @@ def pesquisar_pedidos_tiny(
             "sort": "DESC"
         }
 
-        resposta = tiny_post("pedidos.pesquisa.php", payload)
-        retorno = resposta.get("retorno", {})
+        try:
+            resposta = tiny_post("pedidos.pesquisa.php", payload)
+            retorno = resposta.get("retorno", {})
+        except HTTPException as e:
+            detail = e.detail
+
+            if isinstance(detail, dict):
+                retorno_erro = detail.get("retorno", {})
+                codigo_erro = str(retorno_erro.get("codigo_erro", ""))
+                erros = retorno_erro.get("erros", [])
+
+                mensagem_erro = ""
+                if erros and isinstance(erros, list):
+                    mensagem_erro = str(erros[0].get("erro", ""))
+
+                # Código 20 no Tiny/Olist = consulta sem registros
+                if codigo_erro == "20" or "não retornou registros" in mensagem_erro.lower():
+                    return []
+
+            raise e
 
         pedidos = retorno.get("pedidos", []) or []
 
@@ -461,7 +474,6 @@ def calcular_rankings(
                 or data_final
             )
 
-            # Se vier em DD/MM/YYYY, converte para YYYY-MM-DD
             if isinstance(data_pedido, str) and "/" in data_pedido:
                 try:
                     data_pedido = datetime.strptime(
@@ -692,7 +704,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "versao": "1.0.1",
+        "versao": "1.0.2",
         "rotas": [
             "/health",
             "/teste/tiny-pedidos",
