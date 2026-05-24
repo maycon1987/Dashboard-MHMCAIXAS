@@ -1,6 +1,7 @@
 import os
+import time
 import requests
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
@@ -23,7 +24,7 @@ TINY_BASE_URL = "https://api.tiny.com.br/api2"
 app = FastAPI(
     title="MHM Dashboard Tiny API",
     description="Backend online para dashboard MHM com Tiny/Olist, Supabase e Lovable.",
-    version="1.0.2",
+    version="1.1.0",
 )
 
 
@@ -51,6 +52,24 @@ def hoje_iso() -> str:
 def inicio_mes_iso() -> str:
     hoje = date.today()
     return hoje.replace(day=1).strftime("%Y-%m-%d")
+
+
+def ano_atual() -> int:
+    return date.today().year
+
+
+def mes_atual() -> int:
+    return date.today().month
+
+
+def primeiro_dia_mes(ano: int, mes: int) -> date:
+    return date(ano, mes, 1)
+
+
+def ultimo_dia_mes(ano: int, mes: int) -> date:
+    if mes == 12:
+        return date(ano, 12, 31)
+    return date(ano, mes + 1, 1) - timedelta(days=1)
 
 
 def formatar_data_br(data_iso: str) -> str:
@@ -109,14 +128,14 @@ def verificar_supabase():
 # SUPABASE REST
 # =========================
 
-def supabase_headers() -> Dict[str, str]:
+def supabase_headers(prefer: str = "return=representation") -> Dict[str, str]:
     verificar_supabase()
 
     return {
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation"
+        "Prefer": prefer,
     }
 
 
@@ -128,18 +147,19 @@ def supabase_insert(
     verificar_supabase()
 
     url = f"{SUPABASE_URL}/rest/v1/{tabela}"
-    headers = supabase_headers()
 
     if on_conflict:
-        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+        headers = supabase_headers("resolution=merge-duplicates,return=representation")
         url += f"?on_conflict={on_conflict}"
+    else:
+        headers = supabase_headers("return=representation")
 
     try:
         response = requests.post(
             url,
             headers=headers,
             json=dados,
-            timeout=30
+            timeout=60
         )
 
         if response.status_code not in [200, 201]:
@@ -152,7 +172,10 @@ def supabase_insert(
                 }
             )
 
-        return response.json()
+        if response.text:
+            return response.json()
+
+        return {"status": "ok"}
 
     except requests.RequestException as e:
         raise HTTPException(
@@ -176,7 +199,7 @@ def supabase_get(
         response = requests.get(
             url,
             headers=supabase_headers(),
-            timeout=30
+            timeout=60
         )
 
         if response.status_code != 200:
@@ -210,7 +233,7 @@ def supabase_delete(
         response = requests.delete(
             url,
             headers=supabase_headers(),
-            timeout=30
+            timeout=60
         )
 
         if response.status_code not in [200, 204]:
@@ -251,7 +274,7 @@ def tiny_post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     try:
-        response = requests.post(url, data=data, timeout=40)
+        response = requests.post(url, data=data, timeout=60)
         response.raise_for_status()
     except requests.RequestException as e:
         raise HTTPException(
@@ -399,27 +422,8 @@ def extrair_itens_pedido(pedido: Dict[str, Any]) -> List[Dict[str, Any]]:
     return itens
 
 
-def obter_estoque_tiny(id_produto: str) -> Optional[Dict[str, Any]]:
-    if not id_produto:
-        return None
-
-    try:
-        resposta = tiny_post("produto.obter.estoque.php", {"id": id_produto})
-        retorno = resposta.get("retorno", {})
-        produto = retorno.get("produto", {}) or {}
-
-        return {
-            "tiny_id": str(produto.get("id") or id_produto),
-            "nome": produto.get("nome"),
-            "sku": produto.get("codigo"),
-            "estoque_atual": parse_float(produto.get("saldo")),
-        }
-    except Exception:
-        return None
-
-
 # =========================
-# CÁLCULO DE RANKING
+# CÁLCULO DE RANKING E RESUMO
 # =========================
 
 def calcular_rankings(
@@ -600,7 +604,7 @@ def calcular_rankings(
 
 
 # =========================
-# SALVAR NO SUPABASE
+# SALVAR DADOS NO SUPABASE
 # =========================
 
 def salvar_sync_supabase(resultado: Dict[str, Any]) -> Dict[str, Any]:
@@ -632,6 +636,29 @@ def salvar_sync_supabase(resultado: Dict[str, Any]) -> Dict[str, Any]:
         "pedidos_salvos": len(pedidos),
         "itens_salvos": len(itens)
     }
+
+
+def salvar_resumo_diario(data_resumo: str, resultado: Dict[str, Any]) -> Dict[str, Any]:
+    resumo = resultado.get("resumo", {})
+
+    registro = {
+        "data_resumo": data_resumo,
+        "total_pedidos": resumo.get("total_pedidos", 0),
+        "faturamento_total": resumo.get("faturamento_total", 0),
+        "total_unidades_vendidas": resumo.get("total_unidades_vendidas", 0),
+        "ticket_medio": resumo.get("ticket_medio", 0),
+        "total_produtos_diferentes": resumo.get("total_produtos_diferentes", 0),
+        "origem": "Tiny/Olist",
+        "atualizado_em": datetime.utcnow().isoformat()
+    }
+
+    supabase_insert(
+        "resumo_diario",
+        registro,
+        on_conflict="data_resumo"
+    )
+
+    return registro
 
 
 def salvar_ranking_diario(data_ranking: str, produtos: List[Dict[str, Any]]) -> int:
@@ -695,6 +722,87 @@ def salvar_ranking_mensal(data_referencia: str, produtos: List[Dict[str, Any]]) 
     return len(registros)
 
 
+def salvar_resumo_mensal_por_resultado(data_referencia: str, resultado: Dict[str, Any]) -> Dict[str, Any]:
+    dt = datetime.strptime(data_referencia, "%Y-%m-%d")
+    ano = dt.year
+    mes = dt.month
+    resumo = resultado.get("resumo", {})
+
+    registro = {
+        "ano": ano,
+        "mes": mes,
+        "total_pedidos": resumo.get("total_pedidos", 0),
+        "faturamento_total": resumo.get("faturamento_total", 0),
+        "total_unidades_vendidas": resumo.get("total_unidades_vendidas", 0),
+        "ticket_medio": resumo.get("ticket_medio", 0),
+        "total_produtos_diferentes": resumo.get("total_produtos_diferentes", 0),
+        "origem": "Tiny/Olist",
+        "atualizado_em": datetime.utcnow().isoformat()
+    }
+
+    supabase_insert(
+        "resumo_mensal",
+        registro,
+        on_conflict="ano,mes"
+    )
+
+    return registro
+
+
+def salvar_resumo_anual_por_resultado(ano: int, resultado: Dict[str, Any]) -> Dict[str, Any]:
+    resumo = resultado.get("resumo", {})
+
+    registro = {
+        "ano": ano,
+        "total_pedidos": resumo.get("total_pedidos", 0),
+        "faturamento_total": resumo.get("faturamento_total", 0),
+        "total_unidades_vendidas": resumo.get("total_unidades_vendidas", 0),
+        "ticket_medio": resumo.get("ticket_medio", 0),
+        "total_produtos_diferentes": resumo.get("total_produtos_diferentes", 0),
+        "origem": "Tiny/Olist",
+        "atualizado_em": datetime.utcnow().isoformat()
+    }
+
+    supabase_insert(
+        "resumo_anual",
+        registro,
+        on_conflict="ano"
+    )
+
+    return registro
+
+
+def registrar_sync_log(
+    tipo_sync: str,
+    data_inicial: str,
+    data_final: str,
+    status: str,
+    mensagem: str = "",
+    total_pedidos: int = 0,
+    total_itens: int = 0,
+    total_produtos: int = 0,
+    erro: str = ""
+) -> None:
+    try:
+        supabase_insert(
+            "sync_logs",
+            {
+                "tipo_sync": tipo_sync,
+                "data_inicial": data_inicial,
+                "data_final": data_final,
+                "status": status,
+                "mensagem": mensagem,
+                "total_pedidos": total_pedidos,
+                "total_itens": total_itens,
+                "total_produtos": total_produtos,
+                "erro": erro,
+                "finalizado_em": datetime.utcnow().isoformat() if status in ["concluido", "erro"] else None
+            }
+        )
+    except Exception:
+        pass
+
+
 # =========================
 # ROTAS PRINCIPAIS
 # =========================
@@ -704,7 +812,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "versao": "1.0.2",
+        "versao": "1.1.0",
         "rotas": [
             "/health",
             "/teste/tiny-pedidos",
@@ -714,8 +822,15 @@ def home():
             "/dashboard/periodo",
             "/sync/tiny-dia",
             "/sync/tiny-mes",
+            "/sync/tiny-ano",
+            "/sync/tiny-periodo",
+            "/db/resumo-diario",
+            "/db/resumo-mensal",
+            "/db/resumo-anual",
+            "/db/dashboard-resumo",
             "/db/ranking-diario",
-            "/db/ranking-mensal"
+            "/db/ranking-mensal",
+            "/db/sync-logs"
         ]
     }
 
@@ -761,6 +876,11 @@ def teste_supabase():
         "amostra_produtos": produtos
     }
 
+
+# =========================
+# ROTAS QUE CONSULTAM TINY DIRETO
+# Usar com cuidado para não estourar limite.
+# =========================
 
 @app.get("/dashboard/top-dia")
 def dashboard_top_dia(
@@ -835,7 +955,7 @@ def dashboard_periodo(
 
 
 # =========================
-# ROTAS DE SYNC PARA SUPABASE
+# ROTAS DE SINCRONIZAÇÃO
 # =========================
 
 @app.post("/sync/tiny-dia")
@@ -843,62 +963,289 @@ def sync_tiny_dia(
     data: str = Query(default_factory=hoje_iso),
     max_paginas: int = Query(10, ge=1, le=50)
 ):
-    resultado = calcular_rankings(
-        data_inicial=data,
-        data_final=data,
-        max_paginas=max_paginas
-    )
+    try:
+        resultado = calcular_rankings(
+            data_inicial=data,
+            data_final=data,
+            max_paginas=max_paginas
+        )
 
-    salvamento = salvar_sync_supabase(resultado)
+        salvamento = salvar_sync_supabase(resultado)
 
-    total_ranking = salvar_ranking_diario(
-        data_ranking=data,
-        produtos=resultado["produtos_ranking"]
-    )
+        total_ranking = salvar_ranking_diario(
+            data_ranking=data,
+            produtos=resultado["produtos_ranking"]
+        )
 
-    return {
-        "status": "ok",
-        "mensagem": "Sincronização diária concluída.",
-        "data": data,
-        "resumo": resultado["resumo"],
-        "salvamento": salvamento,
-        "ranking_diario_salvo": total_ranking,
-        "top_10_por_quantidade": resultado["top_10_por_quantidade"],
-        "top_10_por_valor": resultado["top_10_por_valor"],
-        "erros": resultado["erros"]
-    }
+        resumo_salvo = salvar_resumo_diario(data, resultado)
+
+        registrar_sync_log(
+            tipo_sync="dia",
+            data_inicial=data,
+            data_final=data,
+            status="concluido",
+            mensagem="Sincronização diária concluída.",
+            total_pedidos=resultado["resumo"]["total_pedidos"],
+            total_itens=salvamento["itens_salvos"],
+            total_produtos=total_ranking
+        )
+
+        return {
+            "status": "ok",
+            "mensagem": "Sincronização diária concluída.",
+            "data": data,
+            "resumo": resultado["resumo"],
+            "resumo_salvo": resumo_salvo,
+            "salvamento": salvamento,
+            "ranking_diario_salvo": total_ranking,
+            "top_10_por_quantidade": resultado["top_10_por_quantidade"],
+            "top_10_por_valor": resultado["top_10_por_valor"],
+            "erros": resultado["erros"]
+        }
+
+    except Exception as e:
+        registrar_sync_log(
+            tipo_sync="dia",
+            data_inicial=data,
+            data_final=data,
+            status="erro",
+            erro=str(e)
+        )
+        raise e
 
 
 @app.post("/sync/tiny-mes")
 def sync_tiny_mes(
-    max_paginas: int = Query(30, ge=1, le=100)
+    ano: Optional[int] = None,
+    mes: Optional[int] = None,
+    max_paginas: int = Query(100, ge=1, le=300)
 ):
-    data_inicial = inicio_mes_iso()
-    data_final = hoje_iso()
+    ano_final = ano or ano_atual()
+    mes_final = mes or mes_atual()
 
-    resultado = calcular_rankings(
+    data_inicial = primeiro_dia_mes(ano_final, mes_final).strftime("%Y-%m-%d")
+    data_final = ultimo_dia_mes(ano_final, mes_final).strftime("%Y-%m-%d")
+
+    try:
+        resultado = calcular_rankings(
+            data_inicial=data_inicial,
+            data_final=data_final,
+            max_paginas=max_paginas
+        )
+
+        salvamento = salvar_sync_supabase(resultado)
+
+        total_ranking = salvar_ranking_mensal(
+            data_referencia=data_final,
+            produtos=resultado["produtos_ranking"]
+        )
+
+        resumo_mensal = salvar_resumo_mensal_por_resultado(data_final, resultado)
+
+        registrar_sync_log(
+            tipo_sync="mes",
+            data_inicial=data_inicial,
+            data_final=data_final,
+            status="concluido",
+            mensagem="Sincronização mensal concluída.",
+            total_pedidos=resultado["resumo"]["total_pedidos"],
+            total_itens=salvamento["itens_salvos"],
+            total_produtos=total_ranking
+        )
+
+        return {
+            "status": "ok",
+            "mensagem": "Sincronização mensal concluída.",
+            "periodo": resultado["periodo"],
+            "resumo": resultado["resumo"],
+            "resumo_mensal_salvo": resumo_mensal,
+            "salvamento": salvamento,
+            "ranking_mensal_salvo": total_ranking,
+            "top_10_por_quantidade": resultado["top_10_por_quantidade"],
+            "top_10_por_valor": resultado["top_10_por_valor"],
+            "erros": resultado["erros"]
+        }
+
+    except Exception as e:
+        registrar_sync_log(
+            tipo_sync="mes",
+            data_inicial=data_inicial,
+            data_final=data_final,
+            status="erro",
+            erro=str(e)
+        )
+        raise e
+
+
+@app.post("/sync/tiny-ano")
+def sync_tiny_ano(
+    ano: int = Query(default_factory=ano_atual),
+    max_paginas: int = Query(300, ge=1, le=1000)
+):
+    data_inicial = f"{ano}-01-01"
+    data_final = f"{ano}-12-31"
+
+    if ano == ano_atual():
+        data_final = hoje_iso()
+
+    try:
+        resultado = calcular_rankings(
+            data_inicial=data_inicial,
+            data_final=data_final,
+            max_paginas=max_paginas
+        )
+
+        salvamento = salvar_sync_supabase(resultado)
+        resumo_anual = salvar_resumo_anual_por_resultado(ano, resultado)
+
+        registrar_sync_log(
+            tipo_sync="ano",
+            data_inicial=data_inicial,
+            data_final=data_final,
+            status="concluido",
+            mensagem="Sincronização anual concluída.",
+            total_pedidos=resultado["resumo"]["total_pedidos"],
+            total_itens=salvamento["itens_salvos"],
+            total_produtos=resultado["resumo"]["total_produtos_diferentes"]
+        )
+
+        return {
+            "status": "ok",
+            "mensagem": "Sincronização anual concluída.",
+            "periodo": resultado["periodo"],
+            "resumo": resultado["resumo"],
+            "resumo_anual_salvo": resumo_anual,
+            "salvamento": salvamento,
+            "erros": resultado["erros"]
+        }
+
+    except Exception as e:
+        registrar_sync_log(
+            tipo_sync="ano",
+            data_inicial=data_inicial,
+            data_final=data_final,
+            status="erro",
+            erro=str(e)
+        )
+        raise e
+
+
+@app.post("/sync/tiny-periodo")
+def sync_tiny_periodo(
+    data_inicial: str = Query(..., description="Formato YYYY-MM-DD"),
+    data_final: str = Query(..., description="Formato YYYY-MM-DD"),
+    max_paginas_por_dia: int = Query(10, ge=1, le=50),
+    pausa_segundos: float = Query(2.0, ge=0, le=10)
+):
+    """
+    Sincroniza um período dia por dia.
+    Use com cuidado para não bloquear API do Tiny.
+    Recomendado começar com poucos dias.
+    """
+
+    inicio = datetime.strptime(data_inicial, "%Y-%m-%d").date()
+    fim = datetime.strptime(data_final, "%Y-%m-%d").date()
+
+    if fim < inicio:
+        raise HTTPException(
+            status_code=400,
+            detail="data_final não pode ser menor que data_inicial."
+        )
+
+    dias = []
+    atual = inicio
+
+    while atual <= fim:
+        dias.append(atual.strftime("%Y-%m-%d"))
+        atual += timedelta(days=1)
+
+    resultados = []
+    total_pedidos = 0
+    total_itens = 0
+    total_produtos = 0
+
+    registrar_sync_log(
+        tipo_sync="periodo",
         data_inicial=data_inicial,
         data_final=data_final,
-        max_paginas=max_paginas
+        status="iniciado",
+        mensagem=f"Iniciando sincronização de {len(dias)} dias."
     )
 
-    salvamento = salvar_sync_supabase(resultado)
+    for data_dia in dias:
+        try:
+            resultado = calcular_rankings(
+                data_inicial=data_dia,
+                data_final=data_dia,
+                max_paginas=max_paginas_por_dia
+            )
 
-    total_ranking = salvar_ranking_mensal(
-        data_referencia=data_final,
-        produtos=resultado["produtos_ranking"]
+            salvamento = salvar_sync_supabase(resultado)
+
+            ranking_salvo = salvar_ranking_diario(
+                data_ranking=data_dia,
+                produtos=resultado["produtos_ranking"]
+            )
+
+            resumo_salvo = salvar_resumo_diario(data_dia, resultado)
+
+            total_pedidos += resultado["resumo"]["total_pedidos"]
+            total_itens += salvamento["itens_salvos"]
+            total_produtos += ranking_salvo
+
+            resultados.append({
+                "data": data_dia,
+                "status": "ok",
+                "resumo": resultado["resumo"],
+                "salvamento": salvamento,
+                "ranking_diario_salvo": ranking_salvo,
+                "resumo_salvo": resumo_salvo,
+                "erros": resultado["erros"]
+            })
+
+            if pausa_segundos > 0:
+                time.sleep(pausa_segundos)
+
+        except Exception as e:
+            resultados.append({
+                "data": data_dia,
+                "status": "erro",
+                "erro": str(e)
+            })
+
+            registrar_sync_log(
+                tipo_sync="periodo_dia",
+                data_inicial=data_dia,
+                data_final=data_dia,
+                status="erro",
+                erro=str(e)
+            )
+
+            # Para não continuar batendo no Tiny se ele bloquear.
+            if "Excedido o número de acessos" in str(e) or "API Bloqueada" in str(e):
+                break
+
+    registrar_sync_log(
+        tipo_sync="periodo",
+        data_inicial=data_inicial,
+        data_final=data_final,
+        status="concluido",
+        mensagem="Sincronização por período finalizada.",
+        total_pedidos=total_pedidos,
+        total_itens=total_itens,
+        total_produtos=total_produtos
     )
 
     return {
         "status": "ok",
-        "mensagem": "Sincronização mensal concluída.",
-        "periodo": resultado["periodo"],
-        "resumo": resultado["resumo"],
-        "salvamento": salvamento,
-        "ranking_mensal_salvo": total_ranking,
-        "top_10_por_quantidade": resultado["top_10_por_quantidade"],
-        "top_10_por_valor": resultado["top_10_por_valor"],
-        "erros": resultado["erros"]
+        "mensagem": "Sincronização por período finalizada.",
+        "data_inicial": data_inicial,
+        "data_final": data_final,
+        "dias_processados": len(resultados),
+        "total_pedidos": total_pedidos,
+        "total_itens": total_itens,
+        "total_produtos_ranking": total_produtos,
+        "resultados": resultados
     }
 
 
@@ -953,4 +1300,143 @@ def db_ranking_mensal(
         "ano": ano_final,
         "mes": mes_final,
         "ranking": dados
+    }
+
+
+@app.get("/db/resumo-diario")
+def db_resumo_diario(
+    data: str = Query(default_factory=hoje_iso)
+):
+    query = (
+        "select=*"
+        f"&data_resumo=eq.{data}"
+        "&limit=1"
+    )
+
+    dados = supabase_get("resumo_diario", query)
+
+    return {
+        "status": "ok",
+        "data": data,
+        "resumo": dados[0] if dados else None
+    }
+
+
+@app.get("/db/resumo-mensal")
+def db_resumo_mensal(
+    ano: Optional[int] = None,
+    mes: Optional[int] = None
+):
+    hoje = date.today()
+
+    ano_final = ano or hoje.year
+    mes_final = mes or hoje.month
+
+    query = (
+        "select=*"
+        f"&ano=eq.{ano_final}"
+        f"&mes=eq.{mes_final}"
+        "&limit=1"
+    )
+
+    dados = supabase_get("resumo_mensal", query)
+
+    return {
+        "status": "ok",
+        "ano": ano_final,
+        "mes": mes_final,
+        "resumo": dados[0] if dados else None
+    }
+
+
+@app.get("/db/resumo-anual")
+def db_resumo_anual(
+    ano: Optional[int] = None
+):
+    ano_final = ano or ano_atual()
+
+    query = (
+        "select=*"
+        f"&ano=eq.{ano_final}"
+        "&limit=1"
+    )
+
+    dados = supabase_get("resumo_anual", query)
+
+    return {
+        "status": "ok",
+        "ano": ano_final,
+        "resumo": dados[0] if dados else None
+    }
+
+
+@app.get("/db/dashboard-resumo")
+def db_dashboard_resumo(
+    data: str = Query(default_factory=hoje_iso),
+    limite_ranking: int = Query(10, ge=1, le=100)
+):
+    dt = datetime.strptime(data, "%Y-%m-%d").date()
+
+    resumo_diario = supabase_get(
+        "resumo_diario",
+        f"select=*&data_resumo=eq.{data}&limit=1"
+    )
+
+    resumo_mensal = supabase_get(
+        "resumo_mensal",
+        f"select=*&ano=eq.{dt.year}&mes=eq.{dt.month}&limit=1"
+    )
+
+    resumo_anual = supabase_get(
+        "resumo_anual",
+        f"select=*&ano=eq.{dt.year}&limit=1"
+    )
+
+    ranking_diario = supabase_get(
+        "ranking_diario",
+        (
+            "select=*"
+            f"&data_ranking=eq.{data}"
+            "&order=posicao_quantidade.asc"
+            f"&limit={limite_ranking}"
+        )
+    )
+
+    ranking_mensal = supabase_get(
+        "ranking_mensal",
+        (
+            "select=*"
+            f"&ano=eq.{dt.year}"
+            f"&mes=eq.{dt.month}"
+            "&order=posicao_quantidade.asc"
+            f"&limit={limite_ranking}"
+        )
+    )
+
+    return {
+        "status": "ok",
+        "data": data,
+        "resumo_diario": resumo_diario[0] if resumo_diario else None,
+        "resumo_mensal": resumo_mensal[0] if resumo_mensal else None,
+        "resumo_anual": resumo_anual[0] if resumo_anual else None,
+        "ranking_diario": ranking_diario,
+        "ranking_mensal": ranking_mensal
+    }
+
+
+@app.get("/db/sync-logs")
+def db_sync_logs(
+    limite: int = Query(20, ge=1, le=100)
+):
+    query = (
+        "select=*"
+        "&order=criado_em.desc"
+        f"&limit={limite}"
+    )
+
+    dados = supabase_get("sync_logs", query)
+
+    return {
+        "status": "ok",
+        "logs": dados
     }
