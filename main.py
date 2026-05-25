@@ -761,7 +761,7 @@ def sincronizar_periodo(
         data_fim
     )
 
-    if tipo == "dia" and data_inicio == data_fim:
+       if tipo == "dia" and data_inicio == data_fim:
         resumo_diario = {
             "data": data_inicio.isoformat(),
             "data_resumo": data_inicio.isoformat(),
@@ -771,7 +771,7 @@ def sincronizar_periodo(
             "updated_at": datetime.now().isoformat()
         }
 
-    supabase_insert(
+        supabase_insert(
             "resumo_diario",
             resumo_diario,
             upsert=True,
