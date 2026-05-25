@@ -771,11 +771,11 @@ def sincronizar_periodo(
             "updated_at": datetime.now().isoformat()
         }
 
-        supabase_insert(
+    supabase_insert(
             "resumo_diario",
             resumo_diario,
             upsert=True,
-            on_conflict="data"
+            on_conflict="data_resumo"
         )
 
     elif tipo == "mes":
