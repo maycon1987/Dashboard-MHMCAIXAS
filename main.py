@@ -761,16 +761,22 @@ def sincronizar_periodo(
         data_fim
     )
 
-    if tipo == "dia" and data_inicio == data_fim:
-       resumo_diario = {
-    "data": data_inicio.isoformat(),
-    "data_resumo": data_inicio.isoformat(),
-    "faturamento": calculado["faturamento"],
-    "total_pedidos": calculado["total_pedidos"],
-    "ticket_medio": calculado["ticket_medio"],
-    "updated_at": datetime.now().isoformat()
-}
-        supabase_insert("resumo_diario", resumo_diario, upsert=True, on_conflict="data")
+     if tipo == "dia" and data_inicio == data_fim:
+        resumo_diario = {
+            "data": data_inicio.isoformat(),
+            "data_resumo": data_inicio.isoformat(),
+            "faturamento": calculado["faturamento"],
+            "total_pedidos": calculado["total_pedidos"],
+            "ticket_medio": calculado["ticket_medio"],
+            "updated_at": datetime.now().isoformat()
+        }
+
+        supabase_insert(
+            "resumo_diario",
+            resumo_diario,
+            upsert=True,
+            on_conflict="data"
+        )
 
     elif tipo == "mes":
         resumo_mensal = {
@@ -783,7 +789,12 @@ def sincronizar_periodo(
             "ticket_medio": calculado["ticket_medio"],
             "updated_at": datetime.now().isoformat()
         }
-        supabase_insert("resumo_mensal", resumo_mensal, upsert=False)
+
+        supabase_insert(
+            "resumo_mensal",
+            resumo_mensal,
+            upsert=False
+        )
 
     elif tipo == "ano":
         resumo_anual = {
@@ -795,7 +806,12 @@ def sincronizar_periodo(
             "ticket_medio": calculado["ticket_medio"],
             "updated_at": datetime.now().isoformat()
         }
-        supabase_insert("resumo_anual", resumo_anual, upsert=False)
+
+        supabase_insert(
+            "resumo_anual",
+            resumo_anual,
+            upsert=False
+        )
 
     # Ranking período genérico
     ranking_periodo_payload = []
