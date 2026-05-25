@@ -543,17 +543,21 @@ def extrair_itens_do_pedido_completo(
         codigo = item.get("codigo", "")
 
         itens.append({
-            "pedido_tiny_id": safe_str(pedido_id),
-            "data_pedido": data_pedido,
-            "produto_nome": produto_nome,
-            "codigo": safe_str(codigo),
-            "sku": safe_str(codigo),
-            "quantidade": quantidade,
-            "valor_unitario": valor_unitario,
-            "valor_total": valor_total,
-            "raw": item,
-            "updated_at": datetime.now().isoformat()
-        })
+    "pedido_tiny_id": safe_str(pedido_id),
+    "data_pedido": data_pedido,
+
+    # Mantém compatibilidade com banco novo e banco antigo
+    "produto_nome": produto_nome,
+    "nome_produto": produto_nome,
+
+    "codigo": safe_str(codigo),
+    "sku": safe_str(codigo),
+    "quantidade": quantidade,
+    "valor_unitario": valor_unitario,
+    "valor_total": valor_total,
+    "raw": item,
+    "updated_at": datetime.now().isoformat()
+})
 
     return itens
 
