@@ -762,13 +762,14 @@ def sincronizar_periodo(
     )
 
     if tipo == "dia" and data_inicio == data_fim:
-        resumo_diario = {
-            "data": data_inicio.isoformat(),
-            "faturamento": calculado["faturamento"],
-            "total_pedidos": calculado["total_pedidos"],
-            "ticket_medio": calculado["ticket_medio"],
-            "updated_at": datetime.now().isoformat()
-        }
+       resumo_diario = {
+    "data": data_inicio.isoformat(),
+    "data_resumo": data_inicio.isoformat(),
+    "faturamento": calculado["faturamento"],
+    "total_pedidos": calculado["total_pedidos"],
+    "ticket_medio": calculado["ticket_medio"],
+    "updated_at": datetime.now().isoformat()
+}
         supabase_insert("resumo_diario", resumo_diario, upsert=True, on_conflict="data")
 
     elif tipo == "mes":
