@@ -693,8 +693,6 @@ def limpar_ranking_periodo(data_inicio: date, data_fim: date, tipo: str):
         )
     except Exception:
         pass
-
-
 def sincronizar_periodo(
     data_inicio: date,
     data_fim: date,
@@ -761,7 +759,7 @@ def sincronizar_periodo(
         data_fim
     )
 
-       if tipo == "dia" and data_inicio == data_fim:
+    if tipo == "dia" and data_inicio == data_fim:
         resumo_diario = {
             "data": data_inicio.isoformat(),
             "data_resumo": data_inicio.isoformat(),
@@ -813,8 +811,8 @@ def sincronizar_periodo(
             upsert=False
         )
 
-    # Ranking período genérico
     ranking_periodo_payload = []
+
     for item in calculado["ranking"]:
         ranking_periodo_payload.append({
             "data_inicio": data_inicio.isoformat(),
@@ -833,7 +831,11 @@ def sincronizar_periodo(
         limpar_ranking_periodo(data_inicio, data_fim, tipo)
 
         try:
-            supabase_insert("ranking_periodo", ranking_periodo_payload, upsert=False)
+            supabase_insert(
+                "ranking_periodo",
+                ranking_periodo_payload,
+                upsert=False
+            )
         except Exception:
             pass
 
