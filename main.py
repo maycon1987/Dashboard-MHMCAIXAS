@@ -2,35 +2,23 @@ import os
 import time
 import requests
 from datetime import date, datetime, timedelta
-from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from calendar import monthrange
+from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 
-# =========================
-# CONFIGURAÇÕES
-# =========================
-
-TINY_TOKEN = os.getenv("TINY_TOKEN", "").strip()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
-
-TINY_BASE_URL = "https://api.tiny.com.br/api2"
-
+# ============================================================
+# APP
+# ============================================================
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    description="Backend online para dashboard MHM com Tiny/Olist, Supabase e Lovable.",
-    version="1.1.0",
+    version="2.0.0",
+    description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
-
-
-# =========================
-# CORS
-# =========================
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,49 +29,54 @@ app.add_middleware(
 )
 
 
-# =========================
+# ============================================================
+# ENV
+# ============================================================
+
+TINY_TOKEN = os.getenv("TINY_TOKEN", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+TINY_BASE_URL = "https://api.tiny.com.br/api2"
+
+
+# ============================================================
 # HELPERS GERAIS
-# =========================
+# ============================================================
 
-def hoje_iso() -> str:
-    return date.today().strftime("%Y-%m-%d")
-
-
-def inicio_mes_iso() -> str:
-    hoje = date.today()
-    return hoje.replace(day=1).strftime("%Y-%m-%d")
+def hoje_br() -> date:
+    return datetime.now().date()
 
 
-def ano_atual() -> int:
-    return date.today().year
-
-
-def mes_atual() -> int:
-    return date.today().month
-
-
-def primeiro_dia_mes(ano: int, mes: int) -> date:
-    return date(ano, mes, 1)
-
-
-def ultimo_dia_mes(ano: int, mes: int) -> date:
-    if mes == 12:
-        return date(ano, 12, 31)
-    return date(ano, mes + 1, 1) - timedelta(days=1)
-
-
-def formatar_data_br(data_iso: str) -> str:
+def parse_data(data_str: str) -> date:
     try:
-        dt = datetime.strptime(data_iso, "%Y-%m-%d")
-        return dt.strftime("%d/%m/%Y")
-    except ValueError:
+        return datetime.strptime(data_str, "%Y-%m-%d").date()
+    except Exception:
         raise HTTPException(
             status_code=400,
-            detail="Data inválida. Use o formato YYYY-MM-DD. Exemplo: 2026-05-23"
+            detail="Data inválida. Use o formato YYYY-MM-DD."
         )
 
 
-def parse_float(valor: Any) -> float:
+def data_br_para_iso(data_br: str) -> Optional[str]:
+    """
+    Tiny normalmente retorna data como DD/MM/YYYY.
+    Converte para YYYY-MM-DD.
+    """
+    if not data_br:
+        return None
+
+    try:
+        return datetime.strptime(data_br, "%d/%m/%Y").date().isoformat()
+    except Exception:
+        return None
+
+
+def data_iso_para_br(data_iso: str) -> str:
+    return datetime.strptime(data_iso, "%Y-%m-%d").strftime("%d/%m/%Y")
+
+
+def dinheiro_para_float(valor: Any) -> float:
     if valor is None:
         return 0.0
 
@@ -91,7 +84,6 @@ def parse_float(valor: Any) -> float:
         return float(valor)
 
     texto = str(valor).strip()
-
     if not texto:
         return 0.0
 
@@ -104,734 +96,663 @@ def parse_float(valor: Any) -> float:
 
     try:
         return float(texto)
-    except ValueError:
+    except Exception:
         return 0.0
 
 
-def verificar_tiny():
+def validar_env():
+    faltando = []
+
     if not TINY_TOKEN:
+        faltando.append("TINY_TOKEN")
+
+    if not SUPABASE_URL:
+        faltando.append("SUPABASE_URL")
+
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        faltando.append("SUPABASE_SERVICE_ROLE_KEY")
+
+    if faltando:
         raise HTTPException(
             status_code=500,
-            detail="TINY_TOKEN não configurado no Railway."
+            detail={
+                "erro": "Variáveis de ambiente ausentes no Railway.",
+                "faltando": faltando
+            }
         )
 
 
-def verificar_supabase():
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="SUPABASE_URL ou SUPABASE_SERVICE_KEY não configurados no Railway."
-        )
-
-
-# =========================
+# ============================================================
 # SUPABASE REST
-# =========================
+# ============================================================
 
-def supabase_headers(prefer: str = "return=representation") -> Dict[str, str]:
-    verificar_supabase()
+def supabase_headers(prefer: Optional[str] = None) -> Dict[str, str]:
+    validar_env()
 
-    return {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": prefer,
     }
+
+    if prefer:
+        headers["Prefer"] = prefer
+
+    return headers
+
+
+def supabase_get(
+    tabela: str,
+    params: Optional[Dict[str, str]] = None
+) -> List[Dict[str, Any]]:
+    url = f"{SUPABASE_URL}/rest/v1/{tabela}"
+
+    response = requests.get(
+        url,
+        headers=supabase_headers(),
+        params=params or {},
+        timeout=60
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": f"Erro ao consultar Supabase tabela {tabela}",
+                "status_code": response.status_code,
+                "resposta": response.text
+            }
+        )
+
+    return response.json()
 
 
 def supabase_insert(
     tabela: str,
     dados: Any,
-    on_conflict: Optional[str] = None
+    upsert: bool = False
 ) -> Any:
-    verificar_supabase()
-
     url = f"{SUPABASE_URL}/rest/v1/{tabela}"
 
-    if on_conflict:
-        headers = supabase_headers("resolution=merge-duplicates,return=representation")
-        url += f"?on_conflict={on_conflict}"
-    else:
-        headers = supabase_headers("return=representation")
+    prefer = "return=representation"
+    if upsert:
+        prefer = "resolution=merge-duplicates,return=representation"
 
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=dados,
-            timeout=60
+    response = requests.post(
+        url,
+        headers=supabase_headers(prefer=prefer),
+        json=dados,
+        timeout=60
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": f"Erro ao salvar no Supabase tabela {tabela}",
+                "status_code": response.status_code,
+                "resposta": response.text,
+                "dados_enviados": dados
+            }
         )
 
-        if response.status_code not in [200, 201]:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "mensagem": f"Erro ao salvar na tabela {tabela}.",
-                    "status_code": response.status_code,
-                    "resposta": response.text
-                }
-            )
-
-        if response.text:
-            return response.json()
-
+    try:
+        return response.json()
+    except Exception:
         return {"status": "ok"}
 
-    except requests.RequestException as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao comunicar com Supabase: {str(e)}"
-        )
 
-
-def supabase_get(
+def supabase_patch(
     tabela: str,
-    query: str = ""
+    filtros: Dict[str, str],
+    dados: Dict[str, Any]
 ) -> Any:
-    verificar_supabase()
-
     url = f"{SUPABASE_URL}/rest/v1/{tabela}"
 
-    if query:
-        url += f"?{query}"
+    response = requests.patch(
+        url,
+        headers=supabase_headers(prefer="return=representation"),
+        params=filtros,
+        json=dados,
+        timeout=60
+    )
 
-    try:
-        response = requests.get(
-            url,
-            headers=supabase_headers(),
-            timeout=60
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": f"Erro ao atualizar Supabase tabela {tabela}",
+                "status_code": response.status_code,
+                "resposta": response.text
+            }
         )
 
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "mensagem": f"Erro ao buscar na tabela {tabela}.",
-                    "status_code": response.status_code,
-                    "resposta": response.text
-                }
-            )
-
+    try:
         return response.json()
+    except Exception:
+        return {"status": "ok"}
 
-    except requests.RequestException as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao comunicar com Supabase: {str(e)}"
+
+def salvar_configuracao(chave: str, valor: str):
+    """
+    Usa tabela configuracoes.
+
+    Se ela ainda não existir, crie no Supabase:
+
+    create table if not exists configuracoes (
+      id uuid primary key default gen_random_uuid(),
+      chave text unique not null,
+      valor text,
+      created_at timestamptz default now(),
+      updated_at timestamptz default now()
+    );
+    """
+
+    existente = supabase_get(
+        "configuracoes",
+        {
+            "chave": f"eq.{chave}",
+            "select": "*"
+        }
+    )
+
+    payload = {
+        "chave": chave,
+        "valor": valor,
+        "updated_at": datetime.now().isoformat()
+    }
+
+    if existente:
+        return supabase_patch(
+            "configuracoes",
+            {"chave": f"eq.{chave}"},
+            payload
         )
 
-
-def supabase_delete(
-    tabela: str,
-    query: str
-) -> Any:
-    verificar_supabase()
-
-    url = f"{SUPABASE_URL}/rest/v1/{tabela}?{query}"
-
-    try:
-        response = requests.delete(
-            url,
-            headers=supabase_headers(),
-            timeout=60
-        )
-
-        if response.status_code not in [200, 204]:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "mensagem": f"Erro ao apagar dados da tabela {tabela}.",
-                    "status_code": response.status_code,
-                    "resposta": response.text
-                }
-            )
-
-        if response.text:
-            return response.json()
-
-        return {"status": "apagado"}
-
-    except requests.RequestException as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao comunicar com Supabase: {str(e)}"
-        )
+    return supabase_insert("configuracoes", payload)
 
 
-# =========================
-# TINY API V2
-# =========================
+def buscar_configuracao(chave: str) -> Optional[str]:
+    resultado = supabase_get(
+        "configuracoes",
+        {
+            "chave": f"eq.{chave}",
+            "select": "*",
+            "limit": "1"
+        }
+    )
 
-def tiny_post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    verificar_tiny()
+    if not resultado:
+        return None
+
+    return resultado[0].get("valor")
+
+
+# ============================================================
+# TINY
+# ============================================================
+
+def tiny_get(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    validar_env()
 
     url = f"{TINY_BASE_URL}/{endpoint}"
 
-    data = {
+    params_base = {
         "token": TINY_TOKEN,
         "formato": "json",
-        **payload
     }
 
-    try:
-        response = requests.post(url, data=data, timeout=60)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erro ao comunicar com Tiny/Olist: {str(e)}"
-        )
+    params_base.update(params)
 
-    try:
-        json_data = response.json()
-    except ValueError:
-        raise HTTPException(
-            status_code=502,
-            detail="Tiny/Olist retornou uma resposta que não é JSON."
-        )
+    response = requests.get(url, params=params_base, timeout=90)
 
-    retorno = json_data.get("retorno", {})
-    status = str(retorno.get("status", "")).lower()
-
-    if status == "erro":
+    if response.status_code >= 400:
         raise HTTPException(
-            status_code=400,
+            status_code=500,
             detail={
-                "mensagem": "Tiny/Olist retornou erro.",
+                "erro": "Erro HTTP ao consultar Tiny.",
+                "status_code": response.status_code,
+                "resposta": response.text
+            }
+        )
+
+    try:
+        dados = response.json()
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Tiny não retornou JSON válido.",
+                "resposta": response.text
+            }
+        )
+
+    retorno = dados.get("retorno", {})
+
+    status = retorno.get("status")
+    if status and str(status).upper() == "ERRO":
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Tiny retornou erro.",
                 "retorno": retorno
             }
         )
 
-    return json_data
+    return dados
 
 
 def pesquisar_pedidos_tiny(
-    data_inicial_iso: str,
-    data_final_iso: str,
-    max_paginas: int = 10
-) -> List[Dict[str, Any]]:
-
-    data_inicial_br = formatar_data_br(data_inicial_iso)
-    data_final_br = formatar_data_br(data_final_iso)
-
-    todos = []
-
-    for pagina in range(1, max_paginas + 1):
-        payload = {
-            "dataInicial": data_inicial_br,
-            "dataFinal": data_final_br,
-            "pagina": pagina,
-            "sort": "DESC"
+    data_inicial: date,
+    data_final: date,
+    pagina: int = 1
+) -> Dict[str, Any]:
+    """
+    Pesquisa pedidos no Tiny por período.
+    """
+    return tiny_get(
+        "pedidos.pesquisa.php",
+        {
+            "dataInicial": data_inicial.strftime("%d/%m/%Y"),
+            "dataFinal": data_final.strftime("%d/%m/%Y"),
+            "pagina": pagina
         }
+    )
 
-        try:
-            resposta = tiny_post("pedidos.pesquisa.php", payload)
-            retorno = resposta.get("retorno", {})
-        except HTTPException as e:
-            detail = e.detail
 
-            if isinstance(detail, dict):
-                retorno_erro = detail.get("retorno", {})
-                codigo_erro = str(retorno_erro.get("codigo_erro", ""))
-                erros = retorno_erro.get("erros", [])
+def obter_pedido_tiny(id_pedido: str) -> Dict[str, Any]:
+    return tiny_get(
+        "pedido.obter.php",
+        {
+            "id": id_pedido
+        }
+    )
 
-                mensagem_erro = ""
-                if erros and isinstance(erros, list):
-                    mensagem_erro = str(erros[0].get("erro", ""))
 
-                # Código 20 no Tiny/Olist = consulta sem registros
-                if codigo_erro == "20" or "não retornou registros" in mensagem_erro.lower():
-                    return []
+def extrair_lista_pedidos(resposta_tiny: Dict[str, Any]) -> List[Dict[str, Any]]:
+    retorno = resposta_tiny.get("retorno", {})
+    pedidos_raw = retorno.get("pedidos", [])
 
-            raise e
+    pedidos = []
 
-        pedidos = retorno.get("pedidos", []) or []
+    for item in pedidos_raw:
+        pedido = item.get("pedido", item)
+        pedidos.append(pedido)
 
-        for item in pedidos:
-            pedido = item.get("pedido", item)
-            todos.append(pedido)
+    return pedidos
+
+
+def buscar_pedidos_periodo_tiny(
+    data_inicial: date,
+    data_final: date,
+    pausa_segundos: float = 0.8
+) -> List[Dict[str, Any]]:
+    """
+    Busca pedidos paginando.
+    """
+    todos = []
+    pagina = 1
+
+    while True:
+        resposta = pesquisar_pedidos_tiny(data_inicial, data_final, pagina)
+        retorno = resposta.get("retorno", {})
+
+        pedidos = extrair_lista_pedidos(resposta)
+        todos.extend(pedidos)
 
         numero_paginas = int(retorno.get("numero_paginas", 1) or 1)
 
         if pagina >= numero_paginas:
             break
 
+        pagina += 1
+        time.sleep(pausa_segundos)
+
     return todos
 
 
-def obter_pedido_tiny(id_pedido: Any) -> Dict[str, Any]:
-    resposta = tiny_post("pedido.obter.php", {"id": id_pedido})
-    retorno = resposta.get("retorno", {})
-    return retorno.get("pedido", {}) or {}
+def pedido_tem_venda_valida(pedido: Dict[str, Any]) -> bool:
+    """
+    Evita contar orçamento/cancelado quando o Tiny retorna situação.
+    Ajuste aqui depois se quiser filtrar outros status.
+    """
+    situacao = str(pedido.get("situacao", "")).lower().strip()
+
+    status_invalidos = [
+        "cancelado",
+        "cancelada",
+        "orçamento",
+        "orcamento"
+    ]
+
+    for invalido in status_invalidos:
+        if invalido in situacao:
+            return False
+
+    return True
 
 
-def extrair_itens_pedido(pedido: Dict[str, Any]) -> List[Dict[str, Any]]:
-    itens_raw = pedido.get("itens", []) or []
+def normalizar_pedido_resumo(pedido: Dict[str, Any]) -> Dict[str, Any]:
+    id_pedido = str(
+        pedido.get("id")
+        or pedido.get("numero")
+        or pedido.get("numero_ecommerce")
+        or ""
+    )
+
+    data_pedido_iso = (
+        data_br_para_iso(pedido.get("data_pedido", ""))
+        or data_br_para_iso(pedido.get("data", ""))
+        or data_br_para_iso(pedido.get("data_criacao", ""))
+    )
+
+    valor = dinheiro_para_float(
+        pedido.get("total_pedido")
+        or pedido.get("valor")
+        or pedido.get("total")
+        or 0
+    )
+
+    cliente = pedido.get("nome") or pedido.get("cliente") or ""
+
+    return {
+        "tiny_id": id_pedido,
+        "numero": str(pedido.get("numero", "")),
+        "numero_ecommerce": str(pedido.get("numero_ecommerce", "")),
+        "data_pedido": data_pedido_iso,
+        "cliente": cliente,
+        "situacao": pedido.get("situacao", ""),
+        "valor_total": valor,
+        "raw": pedido,
+        "updated_at": datetime.now().isoformat()
+    }
+
+
+def extrair_itens_do_pedido_completo(
+    pedido_completo: Dict[str, Any],
+    pedido_id: str,
+    data_pedido: Optional[str]
+) -> List[Dict[str, Any]]:
+    retorno = pedido_completo.get("retorno", {})
+    pedido = retorno.get("pedido", {})
+    itens_raw = pedido.get("itens", [])
+
     itens = []
 
-    for item_wrapper in itens_raw:
-        item = item_wrapper.get("item", item_wrapper)
+    for item_wrap in itens_raw:
+        item = item_wrap.get("item", item_wrap)
 
-        produto_id = (
-            item.get("id_produto")
-            or item.get("idProduto")
-            or item.get("produto_id")
-            or ""
-        )
+        quantidade = dinheiro_para_float(item.get("quantidade", 0))
+        valor_unitario = dinheiro_para_float(item.get("valor_unitario", 0))
+        valor_total = quantidade * valor_unitario
 
-        nome = (
-            item.get("descricao")
-            or item.get("nome")
-            or item.get("produto")
-            or "Produto sem nome"
-        )
-
-        sku = (
-            item.get("codigo")
-            or item.get("sku")
-            or item.get("codigo_produto")
-            or ""
-        )
-
-        quantidade = parse_float(
-            item.get("quantidade")
-            or item.get("qtde")
-            or item.get("qtd")
-            or 0
-        )
-
-        valor_unitario = parse_float(
-            item.get("valor_unitario")
-            or item.get("valorUnitario")
-            or item.get("preco")
-            or item.get("valor")
-            or 0
-        )
-
-        valor_total = round(quantidade * valor_unitario, 2)
+        produto_nome = item.get("descricao", "") or item.get("nome", "")
+        codigo = item.get("codigo", "")
 
         itens.append({
-            "tiny_produto_id": str(produto_id) if produto_id else "",
-            "sku": str(sku) if sku else "",
-            "nome_produto": nome,
+            "pedido_tiny_id": str(pedido_id),
+            "data_pedido": data_pedido,
+            "produto_nome": produto_nome,
+            "codigo": str(codigo),
+            "sku": str(codigo),
             "quantidade": quantidade,
             "valor_unitario": valor_unitario,
-            "valor_total": valor_total
+            "valor_total": valor_total,
+            "raw": item,
+            "updated_at": datetime.now().isoformat()
         })
 
     return itens
 
 
-# =========================
-# CÁLCULO DE RANKING E RESUMO
-# =========================
+# ============================================================
+# CÁLCULOS
+# ============================================================
 
-def calcular_rankings(
-    data_inicial: str,
-    data_final: str,
-    max_paginas: int = 10
+def calcular_resumo_e_ranking(
+    pedidos: List[Dict[str, Any]],
+    itens: List[Dict[str, Any]],
+    data_inicio: date,
+    data_fim: date
 ) -> Dict[str, Any]:
+    faturamento = sum(float(p.get("valor_total") or 0) for p in pedidos)
+    total_pedidos = len(pedidos)
 
-    pedidos_resumidos = pesquisar_pedidos_tiny(
-        data_inicial_iso=data_inicial,
-        data_final_iso=data_final,
-        max_paginas=max_paginas
-    )
+    ticket_medio = faturamento / total_pedidos if total_pedidos else 0
 
-    produtos = defaultdict(lambda: {
-        "tiny_produto_id": "",
-        "sku": "",
-        "nome_produto": "",
-        "quantidade_vendida": 0.0,
-        "valor_total_vendido": 0.0,
-        "percentual_participacao": 0.0,
-        "pedidos_count": 0
-    })
+    produtos: Dict[str, Dict[str, Any]] = {}
 
-    pedidos_para_salvar = []
-    itens_para_salvar = []
+    for item in itens:
+        nome = item.get("produto_nome") or "Produto sem nome"
+        sku = item.get("sku") or item.get("codigo") or ""
 
-    total_pedidos = 0
-    faturamento_total = 0.0
-    total_unidades = 0.0
-    erros = []
+        chave = f"{sku}::{nome}"
 
-    for pedido_resumo in pedidos_resumidos:
-        tiny_pedido_id = str(pedido_resumo.get("id") or "")
-
-        if not tiny_pedido_id:
-            continue
-
-        try:
-            pedido = obter_pedido_tiny(tiny_pedido_id)
-
-            numero = str(
-                pedido.get("numero")
-                or pedido_resumo.get("numero")
-                or ""
-            )
-
-            data_pedido = (
-                pedido.get("data_pedido")
-                or pedido.get("data")
-                or pedido_resumo.get("data_pedido")
-                or data_final
-            )
-
-            if isinstance(data_pedido, str) and "/" in data_pedido:
-                try:
-                    data_pedido = datetime.strptime(
-                        data_pedido,
-                        "%d/%m/%Y"
-                    ).strftime("%Y-%m-%d")
-                except Exception:
-                    data_pedido = data_final
-
-            cliente = pedido.get("cliente", {}) or {}
-            cliente_nome = cliente.get("nome") or pedido.get("nome_cliente") or ""
-
-            situacao = pedido.get("situacao") or pedido_resumo.get("situacao") or ""
-
-            itens = extrair_itens_pedido(pedido)
-
-            valor_total_pedido = sum(i["valor_total"] for i in itens)
-
-            pedidos_para_salvar.append({
-                "tiny_id": tiny_pedido_id,
-                "numero": numero,
-                "data_pedido": data_pedido,
-                "cliente_nome": cliente_nome,
-                "situacao": situacao,
-                "canal_venda": "Tiny/Olist",
-                "valor_total": round(valor_total_pedido, 2)
-            })
-
-            total_pedidos += 1
-            faturamento_total += valor_total_pedido
-
-            for item in itens:
-                chave = item["tiny_produto_id"] or item["sku"] or item["nome_produto"]
-
-                produtos[chave]["tiny_produto_id"] = item["tiny_produto_id"]
-                produtos[chave]["sku"] = item["sku"]
-                produtos[chave]["nome_produto"] = item["nome_produto"]
-                produtos[chave]["quantidade_vendida"] += item["quantidade"]
-                produtos[chave]["valor_total_vendido"] += item["valor_total"]
-                produtos[chave]["pedidos_count"] += 1
-
-                total_unidades += item["quantidade"]
-
-                itens_para_salvar.append({
-                    "tiny_pedido_id": tiny_pedido_id,
-                    "tiny_produto_id": item["tiny_produto_id"],
-                    "sku": item["sku"],
-                    "nome_produto": item["nome_produto"],
-                    "quantidade": item["quantidade"],
-                    "valor_unitario": item["valor_unitario"],
-                    "valor_total": item["valor_total"],
-                    "data_pedido": data_pedido
-                })
-
-        except Exception as e:
-            erros.append({
-                "tiny_pedido_id": tiny_pedido_id,
-                "erro": str(e)
-            })
-
-    lista_produtos = []
-
-    for produto in produtos.values():
-        produto["quantidade_vendida"] = round(produto["quantidade_vendida"], 3)
-        produto["valor_total_vendido"] = round(produto["valor_total_vendido"], 2)
-
-        if faturamento_total > 0:
-            produto["percentual_participacao"] = round(
-                (produto["valor_total_vendido"] / faturamento_total) * 100,
-                2
-            )
-        else:
-            produto["percentual_participacao"] = 0.0
-
-        lista_produtos.append(produto)
-
-    ranking_quantidade = sorted(
-        lista_produtos,
-        key=lambda p: p["quantidade_vendida"],
-        reverse=True
-    )
-
-    ranking_valor = sorted(
-        lista_produtos,
-        key=lambda p: p["valor_total_vendido"],
-        reverse=True
-    )
-
-    for index, produto in enumerate(ranking_quantidade, start=1):
-        produto["posicao_quantidade"] = index
-
-    mapa_posicao_valor = {}
-
-    for index, produto in enumerate(ranking_valor, start=1):
-        chave = produto["tiny_produto_id"] or produto["sku"] or produto["nome_produto"]
-        mapa_posicao_valor[chave] = index
-
-    for produto in lista_produtos:
-        chave = produto["tiny_produto_id"] or produto["sku"] or produto["nome_produto"]
-        produto["posicao_valor"] = mapa_posicao_valor.get(chave)
-
-    ticket_medio = faturamento_total / total_pedidos if total_pedidos else 0
-
-    return {
-        "status": "ok",
-        "periodo": {
-            "data_inicial": data_inicial,
-            "data_final": data_final
-        },
-        "resumo": {
-            "total_pedidos": total_pedidos,
-            "faturamento_total": round(faturamento_total, 2),
-            "total_unidades_vendidas": round(total_unidades, 3),
-            "ticket_medio": round(ticket_medio, 2),
-            "total_produtos_diferentes": len(lista_produtos)
-        },
-        "pedidos_para_salvar": pedidos_para_salvar,
-        "itens_para_salvar": itens_para_salvar,
-        "produtos_ranking": lista_produtos,
-        "top_10_por_quantidade": ranking_quantidade[:10],
-        "top_10_por_valor": ranking_valor[:10],
-        "erros": erros
-    }
-
-
-# =========================
-# SALVAR DADOS NO SUPABASE
-# =========================
-
-def salvar_sync_supabase(resultado: Dict[str, Any]) -> Dict[str, Any]:
-    pedidos = resultado.get("pedidos_para_salvar", [])
-    itens = resultado.get("itens_para_salvar", [])
-
-    if pedidos:
-        supabase_insert(
-            "pedidos",
-            pedidos,
-            on_conflict="tiny_id"
-        )
-
-    data_inicial = resultado["periodo"]["data_inicial"]
-    data_final = resultado["periodo"]["data_final"]
-
-    supabase_delete(
-        "itens_pedido",
-        f"data_pedido=gte.{data_inicial}&data_pedido=lte.{data_final}"
-    )
-
-    if itens:
-        supabase_insert(
-            "itens_pedido",
-            itens
-        )
-
-    return {
-        "pedidos_salvos": len(pedidos),
-        "itens_salvos": len(itens)
-    }
-
-
-def salvar_resumo_diario(data_resumo: str, resultado: Dict[str, Any]) -> Dict[str, Any]:
-    resumo = resultado.get("resumo", {})
-
-    registro = {
-        "data_resumo": data_resumo,
-        "total_pedidos": resumo.get("total_pedidos", 0),
-        "faturamento_total": resumo.get("faturamento_total", 0),
-        "total_unidades_vendidas": resumo.get("total_unidades_vendidas", 0),
-        "ticket_medio": resumo.get("ticket_medio", 0),
-        "total_produtos_diferentes": resumo.get("total_produtos_diferentes", 0),
-        "origem": "Tiny/Olist",
-        "atualizado_em": datetime.utcnow().isoformat()
-    }
-
-    supabase_insert(
-        "resumo_diario",
-        registro,
-        on_conflict="data_resumo"
-    )
-
-    return registro
-
-
-def salvar_ranking_diario(data_ranking: str, produtos: List[Dict[str, Any]]) -> int:
-    supabase_delete(
-        "ranking_diario",
-        f"data_ranking=eq.{data_ranking}"
-    )
-
-    registros = []
-
-    for produto in produtos:
-        registros.append({
-            "data_ranking": data_ranking,
-            "tiny_produto_id": produto.get("tiny_produto_id"),
-            "sku": produto.get("sku"),
-            "nome_produto": produto.get("nome_produto"),
-            "quantidade_vendida": produto.get("quantidade_vendida", 0),
-            "valor_total_vendido": produto.get("valor_total_vendido", 0),
-            "percentual_participacao": produto.get("percentual_participacao", 0),
-            "pedidos_count": produto.get("pedidos_count", 0),
-            "posicao_quantidade": produto.get("posicao_quantidade"),
-            "posicao_valor": produto.get("posicao_valor")
-        })
-
-    if registros:
-        supabase_insert("ranking_diario", registros)
-
-    return len(registros)
-
-
-def salvar_ranking_mensal(data_referencia: str, produtos: List[Dict[str, Any]]) -> int:
-    dt = datetime.strptime(data_referencia, "%Y-%m-%d")
-    ano = dt.year
-    mes = dt.month
-
-    supabase_delete(
-        "ranking_mensal",
-        f"ano=eq.{ano}&mes=eq.{mes}"
-    )
-
-    registros = []
-
-    for produto in produtos:
-        registros.append({
-            "ano": ano,
-            "mes": mes,
-            "tiny_produto_id": produto.get("tiny_produto_id"),
-            "sku": produto.get("sku"),
-            "nome_produto": produto.get("nome_produto"),
-            "quantidade_vendida": produto.get("quantidade_vendida", 0),
-            "valor_total_vendido": produto.get("valor_total_vendido", 0),
-            "percentual_participacao": produto.get("percentual_participacao", 0),
-            "pedidos_count": produto.get("pedidos_count", 0),
-            "posicao_quantidade": produto.get("posicao_quantidade"),
-            "posicao_valor": produto.get("posicao_valor")
-        })
-
-    if registros:
-        supabase_insert("ranking_mensal", registros)
-
-    return len(registros)
-
-
-def salvar_resumo_mensal_por_resultado(data_referencia: str, resultado: Dict[str, Any]) -> Dict[str, Any]:
-    dt = datetime.strptime(data_referencia, "%Y-%m-%d")
-    ano = dt.year
-    mes = dt.month
-    resumo = resultado.get("resumo", {})
-
-    registro = {
-        "ano": ano,
-        "mes": mes,
-        "total_pedidos": resumo.get("total_pedidos", 0),
-        "faturamento_total": resumo.get("faturamento_total", 0),
-        "total_unidades_vendidas": resumo.get("total_unidades_vendidas", 0),
-        "ticket_medio": resumo.get("ticket_medio", 0),
-        "total_produtos_diferentes": resumo.get("total_produtos_diferentes", 0),
-        "origem": "Tiny/Olist",
-        "atualizado_em": datetime.utcnow().isoformat()
-    }
-
-    supabase_insert(
-        "resumo_mensal",
-        registro,
-        on_conflict="ano,mes"
-    )
-
-    return registro
-
-
-def salvar_resumo_anual_por_resultado(ano: int, resultado: Dict[str, Any]) -> Dict[str, Any]:
-    resumo = resultado.get("resumo", {})
-
-    registro = {
-        "ano": ano,
-        "total_pedidos": resumo.get("total_pedidos", 0),
-        "faturamento_total": resumo.get("faturamento_total", 0),
-        "total_unidades_vendidas": resumo.get("total_unidades_vendidas", 0),
-        "ticket_medio": resumo.get("ticket_medio", 0),
-        "total_produtos_diferentes": resumo.get("total_produtos_diferentes", 0),
-        "origem": "Tiny/Olist",
-        "atualizado_em": datetime.utcnow().isoformat()
-    }
-
-    supabase_insert(
-        "resumo_anual",
-        registro,
-        on_conflict="ano"
-    )
-
-    return registro
-
-
-def registrar_sync_log(
-    tipo_sync: str,
-    data_inicial: str,
-    data_final: str,
-    status: str,
-    mensagem: str = "",
-    total_pedidos: int = 0,
-    total_itens: int = 0,
-    total_produtos: int = 0,
-    erro: str = ""
-) -> None:
-    try:
-        supabase_insert(
-            "sync_logs",
-            {
-                "tipo_sync": tipo_sync,
-                "data_inicial": data_inicial,
-                "data_final": data_final,
-                "status": status,
-                "mensagem": mensagem,
-                "total_pedidos": total_pedidos,
-                "total_itens": total_itens,
-                "total_produtos": total_produtos,
-                "erro": erro,
-                "finalizado_em": datetime.utcnow().isoformat() if status in ["concluido", "erro"] else None
+        if chave not in produtos:
+            produtos[chave] = {
+                "produto_nome": nome,
+                "sku": sku,
+                "quantidade_total": 0.0,
+                "valor_total": 0.0,
             }
+
+        produtos[chave]["quantidade_total"] += float(item.get("quantidade") or 0)
+        produtos[chave]["valor_total"] += float(item.get("valor_total") or 0)
+
+    ranking = list(produtos.values())
+    ranking.sort(key=lambda x: x["valor_total"], reverse=True)
+
+    for posicao, produto in enumerate(ranking, start=1):
+        produto["posicao"] = posicao
+        produto["percentual_participacao"] = (
+            produto["valor_total"] / faturamento * 100
+            if faturamento > 0
+            else 0
         )
+
+    return {
+        "data_inicio": data_inicio.isoformat(),
+        "data_fim": data_fim.isoformat(),
+        "faturamento": round(faturamento, 2),
+        "total_pedidos": total_pedidos,
+        "ticket_medio": round(ticket_medio, 2),
+        "ranking": ranking
+    }
+
+
+# ============================================================
+# SALVAR SINCRONIZAÇÃO
+# ============================================================
+
+def salvar_sync_log(
+    tipo: str,
+    data_inicio: date,
+    data_fim: date,
+    status: str,
+    mensagem: str,
+    total_pedidos: int = 0,
+    faturamento: float = 0.0
+):
+    payload = {
+        "tipo": tipo,
+        "data_inicio": data_inicio.isoformat(),
+        "data_fim": data_fim.isoformat(),
+        "status": status,
+        "mensagem": mensagem,
+        "total_pedidos": total_pedidos,
+        "faturamento": faturamento,
+        "created_at": datetime.now().isoformat()
+    }
+
+    try:
+        supabase_insert("sync_logs", payload)
     except Exception:
         pass
 
 
-# =========================
-# ROTAS PRINCIPAIS
-# =========================
+def sincronizar_periodo(
+    data_inicio: date,
+    data_fim: date,
+    tipo: str = "periodo",
+    buscar_itens: bool = True
+) -> Dict[str, Any]:
+    """
+    Busca pedidos no Tiny, salva pedidos, itens e resumos no Supabase.
+    """
+
+    pedidos_tiny = buscar_pedidos_periodo_tiny(data_inicio, data_fim)
+
+    pedidos_normalizados = []
+    itens_normalizados = []
+
+    for pedido_raw in pedidos_tiny:
+        if not pedido_tem_venda_valida(pedido_raw):
+            continue
+
+        pedido_norm = normalizar_pedido_resumo(pedido_raw)
+
+        if not pedido_norm.get("tiny_id"):
+            continue
+
+        if not pedido_norm.get("data_pedido"):
+            pedido_norm["data_pedido"] = data_inicio.isoformat()
+
+        pedidos_normalizados.append(pedido_norm)
+
+        if buscar_itens:
+            try:
+                pedido_completo = obter_pedido_tiny(pedido_norm["tiny_id"])
+                itens = extrair_itens_do_pedido_completo(
+                    pedido_completo,
+                    pedido_norm["tiny_id"],
+                    pedido_norm["data_pedido"]
+                )
+                itens_normalizados.extend(itens)
+                time.sleep(0.7)
+            except Exception:
+                continue
+
+    if pedidos_normalizados:
+        supabase_insert("pedidos", pedidos_normalizados, upsert=True)
+
+    if itens_normalizados:
+        supabase_insert("itens_pedido", itens_normalizados, upsert=True)
+
+    calculado = calcular_resumo_e_ranking(
+        pedidos_normalizados,
+        itens_normalizados,
+        data_inicio,
+        data_fim
+    )
+
+    resumo_payload = {
+        "data_inicio": data_inicio.isoformat(),
+        "data_fim": data_fim.isoformat(),
+        "tipo": tipo,
+        "faturamento": calculado["faturamento"],
+        "total_pedidos": calculado["total_pedidos"],
+        "ticket_medio": calculado["ticket_medio"],
+        "updated_at": datetime.now().isoformat()
+    }
+
+    if tipo == "dia" and data_inicio == data_fim:
+        resumo_diario = {
+            "data": data_inicio.isoformat(),
+            "faturamento": calculado["faturamento"],
+            "total_pedidos": calculado["total_pedidos"],
+            "ticket_medio": calculado["ticket_medio"],
+            "updated_at": datetime.now().isoformat()
+        }
+        supabase_insert("resumo_diario", resumo_diario, upsert=True)
+
+    elif tipo == "mes":
+        resumo_mensal = {
+            "ano": data_inicio.year,
+            "mes": data_inicio.month,
+            "data_inicio": data_inicio.isoformat(),
+            "data_fim": data_fim.isoformat(),
+            "faturamento": calculado["faturamento"],
+            "total_pedidos": calculado["total_pedidos"],
+            "ticket_medio": calculado["ticket_medio"],
+            "updated_at": datetime.now().isoformat()
+        }
+        supabase_insert("resumo_mensal", resumo_mensal, upsert=True)
+
+    elif tipo == "ano":
+        resumo_anual = {
+            "ano": data_inicio.year,
+            "data_inicio": data_inicio.isoformat(),
+            "data_fim": data_fim.isoformat(),
+            "faturamento": calculado["faturamento"],
+            "total_pedidos": calculado["total_pedidos"],
+            "ticket_medio": calculado["ticket_medio"],
+            "updated_at": datetime.now().isoformat()
+        }
+        supabase_insert("resumo_anual", resumo_anual, upsert=True)
+
+    # Ranking período genérico
+    ranking_periodo_payload = []
+    for item in calculado["ranking"]:
+        ranking_periodo_payload.append({
+            "data_inicio": data_inicio.isoformat(),
+            "data_fim": data_fim.isoformat(),
+            "tipo": tipo,
+            "posicao": item["posicao"],
+            "produto_nome": item["produto_nome"],
+            "sku": item["sku"],
+            "quantidade_total": item["quantidade_total"],
+            "valor_total": item["valor_total"],
+            "percentual_participacao": item["percentual_participacao"],
+            "updated_at": datetime.now().isoformat()
+        })
+
+    if ranking_periodo_payload:
+        try:
+            supabase_insert("ranking_periodo", ranking_periodo_payload, upsert=True)
+        except Exception:
+            pass
+
+    salvar_sync_log(
+        tipo=tipo,
+        data_inicio=data_inicio,
+        data_fim=data_fim,
+        status="ok",
+        mensagem="Sincronização concluída.",
+        total_pedidos=calculado["total_pedidos"],
+        faturamento=calculado["faturamento"]
+    )
+
+    return {
+        "status": "ok",
+        "tipo": tipo,
+        "data_inicio": data_inicio.isoformat(),
+        "data_fim": data_fim.isoformat(),
+        "total_pedidos": calculado["total_pedidos"],
+        "faturamento": calculado["faturamento"],
+        "ticket_medio": calculado["ticket_medio"],
+        "top_10": calculado["ranking"][:10]
+    }
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+class PeriodoBody(BaseModel):
+    data_inicio: str
+    data_fim: str
+
+
+# ============================================================
+# ROTAS BÁSICAS
+# ============================================================
 
 @app.get("/")
 def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "versao": "1.1.0",
-        "rotas": [
-            "/health",
-            "/teste/tiny-pedidos",
-            "/teste/supabase",
-            "/dashboard/top-dia",
-            "/dashboard/top-mes",
-            "/dashboard/periodo",
-            "/sync/tiny-dia",
-            "/sync/tiny-mes",
-            "/sync/tiny-ano",
-            "/sync/tiny-periodo",
-            "/db/resumo-diario",
-            "/db/resumo-mensal",
-            "/db/resumo-anual",
-            "/db/dashboard-resumo",
-            "/db/ranking-diario",
-            "/db/ranking-mensal",
-            "/db/sync-logs"
-        ]
+        "version": "2.0.0"
     }
 
 
@@ -839,604 +760,528 @@ def home():
 def health():
     return {
         "status": "ok",
-        "tiny_token_configurado": bool(TINY_TOKEN),
-        "supabase_url_configurado": bool(SUPABASE_URL),
-        "supabase_service_key_configurado": bool(SUPABASE_SERVICE_KEY),
-        "data": hoje_iso()
+        "tiny_token_ok": bool(TINY_TOKEN),
+        "supabase_url_ok": bool(SUPABASE_URL),
+        "supabase_key_ok": bool(SUPABASE_SERVICE_ROLE_KEY)
     }
 
 
-@app.get("/teste/tiny-pedidos")
-def teste_tiny_pedidos(
-    data_inicial: str = Query(default_factory=hoje_iso),
-    data_final: str = Query(default_factory=hoje_iso)
-):
-    pedidos = pesquisar_pedidos_tiny(
-        data_inicial_iso=data_inicial,
-        data_final_iso=data_final,
-        max_paginas=1
-    )
-
+@app.get("/rotas")
+def rotas():
     return {
-        "status": "ok",
-        "data_inicial": data_inicial,
-        "data_final": data_final,
-        "total_retornado": len(pedidos),
-        "amostra": pedidos[:5]
+        "sync": [
+            "/sync/tiny-dia",
+            "/sync/tiny-mes",
+            "/sync/tiny-ano",
+            "/sync/tiny-periodo",
+            "/sync/descobrir-data-inicial-tiny"
+        ],
+        "db": [
+            "/db/resumo-diario",
+            "/db/resumo-mensal",
+            "/db/resumo-anual",
+            "/db/dashboard-resumo",
+            "/db/resumo-periodo",
+            "/db/ranking-periodo",
+            "/db/sync-logs"
+        ],
+        "configuracoes": [
+            "/configuracoes/data-inicio-tiny"
+        ]
     }
 
 
-@app.get("/teste/supabase")
-def teste_supabase():
-    produtos = supabase_get("produtos", "select=*&limit=5")
-
-    return {
-        "status": "ok",
-        "mensagem": "Conexão com Supabase funcionando.",
-        "amostra_produtos": produtos
-    }
-
-
-# =========================
-# ROTAS QUE CONSULTAM TINY DIRETO
-# Usar com cuidado para não estourar limite.
-# =========================
-
-@app.get("/dashboard/top-dia")
-def dashboard_top_dia(
-    data: str = Query(default_factory=hoje_iso),
-    max_paginas: int = Query(10, ge=1, le=50)
-):
-    resultado = calcular_rankings(
-        data_inicial=data,
-        data_final=data,
-        max_paginas=max_paginas
-    )
-
-    return {
-        "status": "ok",
-        "tipo": "top_dia",
-        "data": data,
-        "resumo": resultado["resumo"],
-        "top_10_por_quantidade": resultado["top_10_por_quantidade"],
-        "top_10_por_valor": resultado["top_10_por_valor"],
-        "erros": resultado["erros"]
-    }
-
-
-@app.get("/dashboard/top-mes")
-def dashboard_top_mes(
-    max_paginas: int = Query(30, ge=1, le=100)
-):
-    data_inicial = inicio_mes_iso()
-    data_final = hoje_iso()
-
-    resultado = calcular_rankings(
-        data_inicial=data_inicial,
-        data_final=data_final,
-        max_paginas=max_paginas
-    )
-
-    return {
-        "status": "ok",
-        "tipo": "top_mes",
-        "periodo": {
-            "data_inicial": data_inicial,
-            "data_final": data_final
-        },
-        "resumo": resultado["resumo"],
-        "top_10_por_quantidade": resultado["top_10_por_quantidade"],
-        "top_10_por_valor": resultado["top_10_por_valor"],
-        "erros": resultado["erros"]
-    }
-
-
-@app.get("/dashboard/periodo")
-def dashboard_periodo(
-    data_inicial: str = Query(..., description="Formato YYYY-MM-DD"),
-    data_final: str = Query(..., description="Formato YYYY-MM-DD"),
-    max_paginas: int = Query(20, ge=1, le=100)
-):
-    resultado = calcular_rankings(
-        data_inicial=data_inicial,
-        data_final=data_final,
-        max_paginas=max_paginas
-    )
-
-    return {
-        "status": "ok",
-        "tipo": "periodo",
-        "periodo": resultado["periodo"],
-        "resumo": resultado["resumo"],
-        "top_10_por_quantidade": resultado["top_10_por_quantidade"],
-        "top_10_por_valor": resultado["top_10_por_valor"],
-        "erros": resultado["erros"]
-    }
-
-
-# =========================
-# ROTAS DE SINCRONIZAÇÃO
-# =========================
+# ============================================================
+# ROTAS SYNC TINY
+# ============================================================
 
 @app.post("/sync/tiny-dia")
 def sync_tiny_dia(
-    data: str = Query(default_factory=hoje_iso),
-    max_paginas: int = Query(10, ge=1, le=50)
+    data: str = Query(..., description="Data no formato YYYY-MM-DD")
 ):
-    try:
-        resultado = calcular_rankings(
-            data_inicial=data,
-            data_final=data,
-            max_paginas=max_paginas
-        )
-
-        salvamento = salvar_sync_supabase(resultado)
-
-        total_ranking = salvar_ranking_diario(
-            data_ranking=data,
-            produtos=resultado["produtos_ranking"]
-        )
-
-        resumo_salvo = salvar_resumo_diario(data, resultado)
-
-        registrar_sync_log(
-            tipo_sync="dia",
-            data_inicial=data,
-            data_final=data,
-            status="concluido",
-            mensagem="Sincronização diária concluída.",
-            total_pedidos=resultado["resumo"]["total_pedidos"],
-            total_itens=salvamento["itens_salvos"],
-            total_produtos=total_ranking
-        )
-
-        return {
-            "status": "ok",
-            "mensagem": "Sincronização diária concluída.",
-            "data": data,
-            "resumo": resultado["resumo"],
-            "resumo_salvo": resumo_salvo,
-            "salvamento": salvamento,
-            "ranking_diario_salvo": total_ranking,
-            "top_10_por_quantidade": resultado["top_10_por_quantidade"],
-            "top_10_por_valor": resultado["top_10_por_valor"],
-            "erros": resultado["erros"]
-        }
-
-    except Exception as e:
-        registrar_sync_log(
-            tipo_sync="dia",
-            data_inicial=data,
-            data_final=data,
-            status="erro",
-            erro=str(e)
-        )
-        raise e
+    data_ref = parse_data(data)
+    return sincronizar_periodo(data_ref, data_ref, tipo="dia")
 
 
 @app.post("/sync/tiny-mes")
 def sync_tiny_mes(
-    ano: Optional[int] = None,
-    mes: Optional[int] = None,
-    max_paginas: int = Query(100, ge=1, le=300)
+    ano: int = Query(...),
+    mes: int = Query(...)
 ):
-    ano_final = ano or ano_atual()
-    mes_final = mes or mes_atual()
+    if mes < 1 or mes > 12:
+        raise HTTPException(status_code=400, detail="Mês inválido.")
 
-    data_inicial = primeiro_dia_mes(ano_final, mes_final).strftime("%Y-%m-%d")
-    data_final = ultimo_dia_mes(ano_final, mes_final).strftime("%Y-%m-%d")
+    data_inicio = date(ano, mes, 1)
+    ultimo_dia = monthrange(ano, mes)[1]
+    data_fim = date(ano, mes, ultimo_dia)
 
-    try:
-        resultado = calcular_rankings(
-            data_inicial=data_inicial,
-            data_final=data_final,
-            max_paginas=max_paginas
-        )
-
-        salvamento = salvar_sync_supabase(resultado)
-
-        total_ranking = salvar_ranking_mensal(
-            data_referencia=data_final,
-            produtos=resultado["produtos_ranking"]
-        )
-
-        resumo_mensal = salvar_resumo_mensal_por_resultado(data_final, resultado)
-
-        registrar_sync_log(
-            tipo_sync="mes",
-            data_inicial=data_inicial,
-            data_final=data_final,
-            status="concluido",
-            mensagem="Sincronização mensal concluída.",
-            total_pedidos=resultado["resumo"]["total_pedidos"],
-            total_itens=salvamento["itens_salvos"],
-            total_produtos=total_ranking
-        )
-
-        return {
-            "status": "ok",
-            "mensagem": "Sincronização mensal concluída.",
-            "periodo": resultado["periodo"],
-            "resumo": resultado["resumo"],
-            "resumo_mensal_salvo": resumo_mensal,
-            "salvamento": salvamento,
-            "ranking_mensal_salvo": total_ranking,
-            "top_10_por_quantidade": resultado["top_10_por_quantidade"],
-            "top_10_por_valor": resultado["top_10_por_valor"],
-            "erros": resultado["erros"]
-        }
-
-    except Exception as e:
-        registrar_sync_log(
-            tipo_sync="mes",
-            data_inicial=data_inicial,
-            data_final=data_final,
-            status="erro",
-            erro=str(e)
-        )
-        raise e
+    return sincronizar_periodo(data_inicio, data_fim, tipo="mes")
 
 
 @app.post("/sync/tiny-ano")
 def sync_tiny_ano(
-    ano: int = Query(default_factory=ano_atual),
-    max_paginas: int = Query(300, ge=1, le=1000)
+    ano: int = Query(...)
 ):
-    data_inicial = f"{ano}-01-01"
-    data_final = f"{ano}-12-31"
+    data_inicio = date(ano, 1, 1)
+    data_fim = date(ano, 12, 31)
 
-    if ano == ano_atual():
-        data_final = hoje_iso()
+    hoje = hoje_br()
+    if data_fim > hoje:
+        data_fim = hoje
 
-    try:
-        resultado = calcular_rankings(
-            data_inicial=data_inicial,
-            data_final=data_final,
-            max_paginas=max_paginas
-        )
-
-        salvamento = salvar_sync_supabase(resultado)
-        resumo_anual = salvar_resumo_anual_por_resultado(ano, resultado)
-
-        registrar_sync_log(
-            tipo_sync="ano",
-            data_inicial=data_inicial,
-            data_final=data_final,
-            status="concluido",
-            mensagem="Sincronização anual concluída.",
-            total_pedidos=resultado["resumo"]["total_pedidos"],
-            total_itens=salvamento["itens_salvos"],
-            total_produtos=resultado["resumo"]["total_produtos_diferentes"]
-        )
-
-        return {
-            "status": "ok",
-            "mensagem": "Sincronização anual concluída.",
-            "periodo": resultado["periodo"],
-            "resumo": resultado["resumo"],
-            "resumo_anual_salvo": resumo_anual,
-            "salvamento": salvamento,
-            "erros": resultado["erros"]
-        }
-
-    except Exception as e:
-        registrar_sync_log(
-            tipo_sync="ano",
-            data_inicial=data_inicial,
-            data_final=data_final,
-            status="erro",
-            erro=str(e)
-        )
-        raise e
+    return sincronizar_periodo(data_inicio, data_fim, tipo="ano")
 
 
 @app.post("/sync/tiny-periodo")
-def sync_tiny_periodo(
-    data_inicial: str = Query(..., description="Formato YYYY-MM-DD"),
-    data_final: str = Query(..., description="Formato YYYY-MM-DD"),
-    max_paginas_por_dia: int = Query(10, ge=1, le=50),
-    pausa_segundos: float = Query(2.0, ge=0, le=10)
-):
-    """
-    Sincroniza um período dia por dia.
-    Use com cuidado para não bloquear API do Tiny.
-    Recomendado começar com poucos dias.
-    """
+def sync_tiny_periodo(body: PeriodoBody):
+    data_inicio = parse_data(body.data_inicio)
+    data_fim = parse_data(body.data_fim)
 
-    inicio = datetime.strptime(data_inicial, "%Y-%m-%d").date()
-    fim = datetime.strptime(data_final, "%Y-%m-%d").date()
-
-    if fim < inicio:
+    if data_fim < data_inicio:
         raise HTTPException(
             status_code=400,
-            detail="data_final não pode ser menor que data_inicial."
+            detail="data_fim não pode ser menor que data_inicio."
         )
 
-    dias = []
-    atual = inicio
+    return sincronizar_periodo(data_inicio, data_fim, tipo="periodo")
 
-    while atual <= fim:
-        dias.append(atual.strftime("%Y-%m-%d"))
-        atual += timedelta(days=1)
 
-    resultados = []
-    total_pedidos = 0
-    total_itens = 0
-    total_produtos = 0
+@app.post("/sync/descobrir-data-inicial-tiny")
+def descobrir_data_inicial_tiny(
+    meses_voltar: int = Query(36, description="Quantidade máxima de meses para voltar procurando pedidos.")
+):
+    """
+    Procura a primeira data com pedido no Tiny.
+    Faz mês por mês para não pesar na API.
+    Depois salva no Supabase em configuracoes:
+    chave = data_inicio_tiny
+    """
 
-    registrar_sync_log(
-        tipo_sync="periodo",
-        data_inicial=data_inicial,
-        data_final=data_final,
-        status="iniciado",
-        mensagem=f"Iniciando sincronização de {len(dias)} dias."
-    )
+    if meses_voltar < 1:
+        meses_voltar = 1
 
-    for data_dia in dias:
+    if meses_voltar > 120:
+        meses_voltar = 120
+
+    hoje = hoje_br()
+
+    meses_com_pedido = []
+
+    ano_atual = hoje.year
+    mes_atual = hoje.month
+
+    for i in range(meses_voltar):
+        mes_calc = mes_atual - i
+        ano_calc = ano_atual
+
+        while mes_calc <= 0:
+            mes_calc += 12
+            ano_calc -= 1
+
+        data_inicio_mes = date(ano_calc, mes_calc, 1)
+        ultimo_dia = monthrange(ano_calc, mes_calc)[1]
+        data_fim_mes = date(ano_calc, mes_calc, ultimo_dia)
+
+        if data_fim_mes > hoje:
+            data_fim_mes = hoje
+
         try:
-            resultado = calcular_rankings(
-                data_inicial=data_dia,
-                data_final=data_dia,
-                max_paginas=max_paginas_por_dia
+            pedidos_mes = buscar_pedidos_periodo_tiny(
+                data_inicio_mes,
+                data_fim_mes,
+                pausa_segundos=0.5
             )
 
-            salvamento = salvar_sync_supabase(resultado)
+            pedidos_validos = [
+                p for p in pedidos_mes
+                if pedido_tem_venda_valida(p)
+            ]
 
-            ranking_salvo = salvar_ranking_diario(
-                data_ranking=data_dia,
-                produtos=resultado["produtos_ranking"]
+            if pedidos_validos:
+                meses_com_pedido.append({
+                    "ano": ano_calc,
+                    "mes": mes_calc,
+                    "data_inicio": data_inicio_mes,
+                    "data_fim": data_fim_mes,
+                    "total": len(pedidos_validos)
+                })
+
+        except Exception:
+            continue
+
+        time.sleep(0.8)
+
+    if not meses_com_pedido:
+        return {
+            "status": "vazio",
+            "mensagem": "Nenhum pedido encontrado no Tiny dentro do período pesquisado.",
+            "meses_voltar": meses_voltar,
+            "data_inicio_tiny": None
+        }
+
+    # O mês mais antigo com pedido será o último da busca temporal
+    mes_mais_antigo = sorted(
+        meses_com_pedido,
+        key=lambda x: x["data_inicio"]
+    )[0]
+
+    primeira_data = None
+
+    dia_inicio = mes_mais_antigo["data_inicio"]
+    dia_fim = mes_mais_antigo["data_fim"]
+
+    dia_atual = dia_inicio
+
+    while dia_atual <= dia_fim:
+        try:
+            pedidos_dia = buscar_pedidos_periodo_tiny(
+                dia_atual,
+                dia_atual,
+                pausa_segundos=0.3
             )
 
-            resumo_salvo = salvar_resumo_diario(data_dia, resultado)
+            pedidos_validos = [
+                p for p in pedidos_dia
+                if pedido_tem_venda_valida(p)
+            ]
 
-            total_pedidos += resultado["resumo"]["total_pedidos"]
-            total_itens += salvamento["itens_salvos"]
-            total_produtos += ranking_salvo
-
-            resultados.append({
-                "data": data_dia,
-                "status": "ok",
-                "resumo": resultado["resumo"],
-                "salvamento": salvamento,
-                "ranking_diario_salvo": ranking_salvo,
-                "resumo_salvo": resumo_salvo,
-                "erros": resultado["erros"]
-            })
-
-            if pausa_segundos > 0:
-                time.sleep(pausa_segundos)
-
-        except Exception as e:
-            resultados.append({
-                "data": data_dia,
-                "status": "erro",
-                "erro": str(e)
-            })
-
-            registrar_sync_log(
-                tipo_sync="periodo_dia",
-                data_inicial=data_dia,
-                data_final=data_dia,
-                status="erro",
-                erro=str(e)
-            )
-
-            # Para não continuar batendo no Tiny se ele bloquear.
-            if "Excedido o número de acessos" in str(e) or "API Bloqueada" in str(e):
+            if pedidos_validos:
+                primeira_data = dia_atual
                 break
 
-    registrar_sync_log(
-        tipo_sync="periodo",
-        data_inicial=data_inicial,
-        data_final=data_final,
-        status="concluido",
-        mensagem="Sincronização por período finalizada.",
-        total_pedidos=total_pedidos,
-        total_itens=total_itens,
-        total_produtos=total_produtos
-    )
+        except Exception:
+            pass
+
+        dia_atual += timedelta(days=1)
+        time.sleep(0.4)
+
+    if not primeira_data:
+        primeira_data = mes_mais_antigo["data_inicio"]
+
+    salvar_configuracao("data_inicio_tiny", primeira_data.isoformat())
 
     return {
         "status": "ok",
-        "mensagem": "Sincronização por período finalizada.",
-        "data_inicial": data_inicial,
-        "data_final": data_final,
-        "dias_processados": len(resultados),
-        "total_pedidos": total_pedidos,
-        "total_itens": total_itens,
-        "total_produtos_ranking": total_produtos,
-        "resultados": resultados
+        "data_inicio_tiny": primeira_data.isoformat(),
+        "mensagem": "Data inicial do Tiny descoberta e salva no Supabase.",
+        "mes_mais_antigo_com_pedido": {
+            "ano": mes_mais_antigo["ano"],
+            "mes": mes_mais_antigo["mes"],
+            "total_pedidos": mes_mais_antigo["total"]
+        }
     }
 
 
-# =========================
-# ROTAS PARA LOVABLE LER DO SUPABASE
-# =========================
+# ============================================================
+# ROTAS CONFIGURAÇÕES
+# ============================================================
 
-@app.get("/db/ranking-diario")
-def db_ranking_diario(
-    data: str = Query(default_factory=hoje_iso),
-    limite: int = Query(10, ge=1, le=100)
-):
-    query = (
-        "select=*"
-        f"&data_ranking=eq.{data}"
-        "&order=posicao_quantidade.asc"
-        f"&limit={limite}"
-    )
+@app.get("/configuracoes/data-inicio-tiny")
+def get_data_inicio_tiny():
+    valor = buscar_configuracao("data_inicio_tiny")
 
-    dados = supabase_get("ranking_diario", query)
+    if not valor:
+        return {
+            "status": "vazio",
+            "data_inicio_tiny": None,
+            "mensagem": "Data inicial ainda não descoberta. Rode POST /sync/descobrir-data-inicial-tiny."
+        }
 
     return {
         "status": "ok",
-        "data": data,
-        "ranking": dados
+        "data_inicio_tiny": valor
     }
 
 
-@app.get("/db/ranking-mensal")
-def db_ranking_mensal(
-    ano: Optional[int] = None,
-    mes: Optional[int] = None,
-    limite: int = Query(10, ge=1, le=100)
-):
-    hoje = date.today()
-
-    ano_final = ano or hoje.year
-    mes_final = mes or hoje.month
-
-    query = (
-        "select=*"
-        f"&ano=eq.{ano_final}"
-        f"&mes=eq.{mes_final}"
-        "&order=posicao_quantidade.asc"
-        f"&limit={limite}"
-    )
-
-    dados = supabase_get("ranking_mensal", query)
-
-    return {
-        "status": "ok",
-        "ano": ano_final,
-        "mes": mes_final,
-        "ranking": dados
-    }
-
+# ============================================================
+# ROTAS DB DASHBOARD
+# ============================================================
 
 @app.get("/db/resumo-diario")
 def db_resumo_diario(
-    data: str = Query(default_factory=hoje_iso)
+    data: Optional[str] = Query(None)
 ):
-    query = (
-        "select=*"
-        f"&data_resumo=eq.{data}"
-        "&limit=1"
-    )
+    params = {
+        "select": "*",
+        "order": "data.desc"
+    }
 
-    dados = supabase_get("resumo_diario", query)
+    if data:
+        params["data"] = f"eq.{data}"
 
     return {
         "status": "ok",
-        "data": data,
-        "resumo": dados[0] if dados else None
+        "dados": supabase_get("resumo_diario", params)
     }
 
 
 @app.get("/db/resumo-mensal")
 def db_resumo_mensal(
-    ano: Optional[int] = None,
-    mes: Optional[int] = None
+    ano: Optional[int] = Query(None),
+    mes: Optional[int] = Query(None)
 ):
-    hoje = date.today()
+    params = {
+        "select": "*",
+        "order": "ano.desc,mes.desc"
+    }
 
-    ano_final = ano or hoje.year
-    mes_final = mes or hoje.month
+    if ano:
+        params["ano"] = f"eq.{ano}"
 
-    query = (
-        "select=*"
-        f"&ano=eq.{ano_final}"
-        f"&mes=eq.{mes_final}"
-        "&limit=1"
-    )
-
-    dados = supabase_get("resumo_mensal", query)
+    if mes:
+        params["mes"] = f"eq.{mes}"
 
     return {
         "status": "ok",
-        "ano": ano_final,
-        "mes": mes_final,
-        "resumo": dados[0] if dados else None
+        "dados": supabase_get("resumo_mensal", params)
     }
 
 
 @app.get("/db/resumo-anual")
 def db_resumo_anual(
-    ano: Optional[int] = None
+    ano: Optional[int] = Query(None)
 ):
-    ano_final = ano or ano_atual()
+    params = {
+        "select": "*",
+        "order": "ano.desc"
+    }
 
-    query = (
-        "select=*"
-        f"&ano=eq.{ano_final}"
-        "&limit=1"
-    )
-
-    dados = supabase_get("resumo_anual", query)
+    if ano:
+        params["ano"] = f"eq.{ano}"
 
     return {
         "status": "ok",
-        "ano": ano_final,
-        "resumo": dados[0] if dados else None
+        "dados": supabase_get("resumo_anual", params)
     }
 
 
 @app.get("/db/dashboard-resumo")
-def db_dashboard_resumo(
-    data: str = Query(default_factory=hoje_iso),
-    limite_ranking: int = Query(10, ge=1, le=100)
-):
-    dt = datetime.strptime(data, "%Y-%m-%d").date()
+def db_dashboard_resumo():
+    hoje = hoje_br()
+    inicio_mes = date(hoje.year, hoje.month, 1)
+    inicio_30 = hoje - timedelta(days=30)
 
-    resumo_diario = supabase_get(
+    resumo_hoje = supabase_get(
         "resumo_diario",
-        f"select=*&data_resumo=eq.{data}&limit=1"
+        {
+            "data": f"eq.{hoje.isoformat()}",
+            "select": "*",
+            "limit": "1"
+        }
     )
 
-    resumo_mensal = supabase_get(
+    resumo_mes = supabase_get(
         "resumo_mensal",
-        f"select=*&ano=eq.{dt.year}&mes=eq.{dt.month}&limit=1"
+        {
+            "ano": f"eq.{hoje.year}",
+            "mes": f"eq.{hoje.month}",
+            "select": "*",
+            "limit": "1"
+        }
     )
 
-    resumo_anual = supabase_get(
-        "resumo_anual",
-        f"select=*&ano=eq.{dt.year}&limit=1"
+    ultimos_logs = supabase_get(
+        "sync_logs",
+        {
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": "10"
+        }
     )
 
-    ranking_diario = supabase_get(
-        "ranking_diario",
-        (
-            "select=*"
-            f"&data_ranking=eq.{data}"
-            "&order=posicao_quantidade.asc"
-            f"&limit={limite_ranking}"
-        )
-    )
-
-    ranking_mensal = supabase_get(
-        "ranking_mensal",
-        (
-            "select=*"
-            f"&ano=eq.{dt.year}"
-            f"&mes=eq.{dt.month}"
-            "&order=posicao_quantidade.asc"
-            f"&limit={limite_ranking}"
-        )
-    )
+    resumo_30 = calcular_resumo_periodo_banco(inicio_30, hoje)
 
     return {
         "status": "ok",
-        "data": data,
-        "resumo_diario": resumo_diario[0] if resumo_diario else None,
-        "resumo_mensal": resumo_mensal[0] if resumo_mensal else None,
-        "resumo_anual": resumo_anual[0] if resumo_anual else None,
-        "ranking_diario": ranking_diario,
-        "ranking_mensal": ranking_mensal
+        "hoje": resumo_hoje[0] if resumo_hoje else None,
+        "mes_atual": resumo_mes[0] if resumo_mes else None,
+        "ultimos_30_dias": resumo_30,
+        "sync_logs": ultimos_logs
     }
 
 
 @app.get("/db/sync-logs")
 def db_sync_logs(
-    limite: int = Query(20, ge=1, le=100)
+    limit: int = Query(20)
 ):
-    query = (
-        "select=*"
-        "&order=criado_em.desc"
-        f"&limit={limite}"
+    return {
+        "status": "ok",
+        "dados": supabase_get(
+            "sync_logs",
+            {
+                "select": "*",
+                "order": "created_at.desc",
+                "limit": str(limit)
+            }
+        )
+    }
+
+
+# ============================================================
+# RESUMO / RANKING POR PERÍODO NO BANCO
+# ============================================================
+
+def buscar_pedidos_banco_periodo(
+    data_inicio: date,
+    data_fim: date
+) -> List[Dict[str, Any]]:
+    return supabase_get(
+        "pedidos",
+        {
+            "select": "*",
+            "data_pedido": f"gte.{data_inicio.isoformat()}",
+            "data_pedido": f"gte.{data_inicio.isoformat()}",
+            "order": "data_pedido.asc"
+        }
     )
 
-    dados = supabase_get("sync_logs", query)
+
+def buscar_pedidos_banco_periodo_corrigido(
+    data_inicio: date,
+    data_fim: date
+) -> List[Dict[str, Any]]:
+    """
+    Supabase REST não aceita duas chaves iguais no dict.
+    Então usamos query string manual com requests.
+    """
+    validar_env()
+
+    url = f"{SUPABASE_URL}/rest/v1/pedidos"
+
+    params = [
+        ("select", "*"),
+        ("data_pedido", f"gte.{data_inicio.isoformat()}"),
+        ("data_pedido", f"lte.{data_fim.isoformat()}"),
+        ("order", "data_pedido.asc")
+    ]
+
+    response = requests.get(
+        url,
+        headers=supabase_headers(),
+        params=params,
+        timeout=60
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Erro ao consultar pedidos por período.",
+                "status_code": response.status_code,
+                "resposta": response.text
+            }
+        )
+
+    return response.json()
+
+
+def buscar_itens_banco_periodo_corrigido(
+    data_inicio: date,
+    data_fim: date
+) -> List[Dict[str, Any]]:
+    validar_env()
+
+    url = f"{SUPABASE_URL}/rest/v1/itens_pedido"
+
+    params = [
+        ("select", "*"),
+        ("data_pedido", f"gte.{data_inicio.isoformat()}"),
+        ("data_pedido", f"lte.{data_fim.isoformat()}"),
+        ("order", "data_pedido.asc")
+    ]
+
+    response = requests.get(
+        url,
+        headers=supabase_headers(),
+        params=params,
+        timeout=60
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Erro ao consultar itens por período.",
+                "status_code": response.status_code,
+                "resposta": response.text
+            }
+        )
+
+    return response.json()
+
+
+def calcular_resumo_periodo_banco(
+    data_inicio: date,
+    data_fim: date
+) -> Dict[str, Any]:
+    pedidos = buscar_pedidos_banco_periodo_corrigido(data_inicio, data_fim)
+    itens = buscar_itens_banco_periodo_corrigido(data_inicio, data_fim)
+
+    calculado = calcular_resumo_e_ranking(
+        pedidos=pedidos,
+        itens=itens,
+        data_inicio=data_inicio,
+        data_fim=data_fim
+    )
+
+    return {
+        "data_inicio": data_inicio.isoformat(),
+        "data_fim": data_fim.isoformat(),
+        "faturamento": calculado["faturamento"],
+        "total_pedidos": calculado["total_pedidos"],
+        "ticket_medio": calculado["ticket_medio"]
+    }
+
+
+@app.get("/db/resumo-periodo")
+def db_resumo_periodo(
+    data_inicio: str = Query(..., description="YYYY-MM-DD"),
+    data_fim: str = Query(..., description="YYYY-MM-DD")
+):
+    inicio = parse_data(data_inicio)
+    fim = parse_data(data_fim)
+
+    if fim < inicio:
+        raise HTTPException(
+            status_code=400,
+            detail="data_fim não pode ser menor que data_inicio."
+        )
 
     return {
         "status": "ok",
-        "logs": dados
+        "dados": calcular_resumo_periodo_banco(inicio, fim)
+    }
+
+
+@app.get("/db/ranking-periodo")
+def db_ranking_periodo(
+    data_inicio: str = Query(..., description="YYYY-MM-DD"),
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    limite: int = Query(10)
+):
+    inicio = parse_data(data_inicio)
+    fim = parse_data(data_fim)
+
+    if fim < inicio:
+        raise HTTPException(
+            status_code=400,
+            detail="data_fim não pode ser menor que data_inicio."
+        )
+
+    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim)
+    itens = buscar_itens_banco_periodo_corrigido(inicio, fim)
+
+    calculado = calcular_resumo_e_ranking(
+        pedidos=pedidos,
+        itens=itens,
+        data_inicio=inicio,
+        data_fim=fim
+    )
+
+    return {
+        "status": "ok",
+        "data_inicio": inicio.isoformat(),
+        "data_fim": fim.isoformat(),
+        "limite": limite,
+        "dados": calculado["ranking"][:limite]
     }
