@@ -761,7 +761,7 @@ def sincronizar_periodo(
         data_fim
     )
 
-     if tipo == "dia" and data_inicio == data_fim:
+    if tipo == "dia" and data_inicio == data_fim:
         resumo_diario = {
             "data": data_inicio.isoformat(),
             "data_resumo": data_inicio.isoformat(),
