@@ -759,24 +759,67 @@ def sincronizar_periodo(
         data_fim
     )
 
-    if tipo == "dia" and data_inicio == data_fim:
-        resumo_diario = {
-            "data": data_inicio.isoformat(),
-            "data_resumo": data_inicio.isoformat(),
-            "faturamento": calculado["faturamento"],
-            "total_pedidos": calculado["total_pedidos"],
-            "ticket_medio": calculado["ticket_medio"],
+    # -------------------------------------------------------
+    # GRAVAR RESUMO_DIARIO — sempre, para qualquer tipo.
+    # Agrupa pedidos por data e grava 1 linha por dia.
+    # Isso garante que blocos históricos (/sync/tiny-periodo)
+    # também populem a resumo_diario corretamente.
+    # -------------------------------------------------------
+    pedidos_por_dia: Dict[str, List[Dict[str, Any]]] = {}
+    itens_por_dia: Dict[str, List[Dict[str, Any]]] = {}
+
+    for p in pedidos_normalizados:
+        dia = p.get("data_pedido") or data_inicio.isoformat()
+        pedidos_por_dia.setdefault(dia, []).append(p)
+
+    for it in itens_normalizados:
+        dia = it.get("data_pedido") or data_inicio.isoformat()
+        itens_por_dia.setdefault(dia, []).append(it)
+
+    dias_para_gravar = set(pedidos_por_dia.keys())
+
+    # Garante que todos os dias do período sejam gravados (dias sem venda ficam zerados)
+    total_dias_periodo = (data_fim - data_inicio).days + 1
+    for i in range(total_dias_periodo):
+        dia_str = (data_inicio + timedelta(days=i)).isoformat()
+        dias_para_gravar.add(dia_str)
+
+    for dia_str in sorted(dias_para_gravar):
+        pedidos_dia = pedidos_por_dia.get(dia_str, [])
+        itens_dia = itens_por_dia.get(dia_str, [])
+
+        fat_dia = round(sum(float(p.get("valor_total") or 0) for p in pedidos_dia), 2)
+        qtd_pedidos_dia = len(pedidos_dia)
+        ticket_dia = round(fat_dia / qtd_pedidos_dia, 2) if qtd_pedidos_dia else 0.0
+        unidades_dia = round(sum(float(it.get("quantidade") or 0) for it in itens_dia), 2)
+        produtos_diferentes = len(set(
+            it.get("sku") or it.get("codigo") or it.get("produto_nome", "")
+            for it in itens_dia
+        ))
+
+        resumo_diario_payload = {
+            "data": dia_str,
+            "data_resumo": dia_str,
+            "faturamento_total": fat_dia,
+            "total_pedidos": qtd_pedidos_dia,
+            "ticket_medio": ticket_dia,
+            "total_unidades_vendidas": unidades_dia,
+            "total_produtos_diferentes": produtos_diferentes,
+            "origem": "Tiny/Olist",
             "updated_at": datetime.now().isoformat()
         }
 
-        supabase_insert(
-            "resumo_diario",
-            resumo_diario,
-            upsert=True,
-            on_conflict="data_resumo"
-        )
+        try:
+            supabase_insert(
+                "resumo_diario",
+                resumo_diario_payload,
+                upsert=True,
+                on_conflict="data_resumo"
+            )
+        except Exception:
+            pass
 
-    elif tipo == "mes":
+    if tipo == "mes":
         resumo_mensal = {
             "ano": data_inicio.year,
             "mes": data_inicio.month,
