@@ -1405,9 +1405,73 @@ def db_resumo_periodo(
             detail="data_fim não pode ser menor que data_inicio."
         )
 
+    # -------------------------------------------------------
+    # CORREÇÃO: somar resumo_diario (1 linha por dia),
+    # nunca pedidos/itens individuais (bate no limite 1000).
+    # -------------------------------------------------------
+    registros = supabase_get(
+        "resumo_diario",
+        {
+            "select": "data_resumo,faturamento_total,total_pedidos,total_unidades_vendidas",
+            "data_resumo": f"gte.{inicio.isoformat()}",
+            "order": "data_resumo.asc",
+            # Supabase filtra os dois parâmetros com o mesmo nome via lista,
+            # mas a helper supabase_get usa dict — usamos params como lista abaixo.
+        }
+    )
+
+    # A helper supabase_get não suporta dois valores para a mesma chave.
+    # Precisamos refazer a query com params como lista de tuplas.
+    validar_env()
+    url = f"{SUPABASE_URL}/rest/v1/resumo_diario"
+    params = [
+        ("select", "data_resumo,faturamento_total,total_pedidos,total_unidades_vendidas"),
+        ("data_resumo", f"gte.{inicio.isoformat()}"),
+        ("data_resumo", f"lte.{fim.isoformat()}"),
+        ("order", "data_resumo.asc"),
+        ("limit", "1000"),
+    ]
+    resp = requests.get(url, headers=supabase_headers(), params=params, timeout=60)
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Erro ao consultar resumo_diario por período.",
+                "status_code": resp.status_code,
+                "resposta": resp.text
+            }
+        )
+    registros = resp.json()
+
+    # Montar lista de dias esperados
+    total_dias = (fim - inicio).days + 1
+    dias_esperados = [
+        (inicio + timedelta(days=i)).isoformat()
+        for i in range(total_dias)
+    ]
+    dias_com_resumo = [r["data_resumo"] for r in registros]
+    dias_faltantes = [d for d in dias_esperados if d not in dias_com_resumo]
+
+    # Somar os campos
+    faturamento_total = round(sum(float(r.get("faturamento_total") or 0) for r in registros), 2)
+    total_pedidos = sum(int(r.get("total_pedidos") or 0) for r in registros)
+    total_unidades = sum(float(r.get("total_unidades_vendidas") or 0) for r in registros)
+    ticket_medio = round(faturamento_total / total_pedidos, 2) if total_pedidos else 0.0
+
     return {
         "status": "ok",
-        "dados": calcular_resumo_periodo_banco(inicio, fim)
+        "dados": {
+            "data_inicio": inicio.isoformat(),
+            "data_fim": fim.isoformat(),
+            "dias_esperados": total_dias,
+            "dias_com_resumo": len(dias_com_resumo),
+            "dias_faltantes": dias_faltantes,
+            "faturamento": faturamento_total,
+            "total_pedidos": total_pedidos,
+            "total_unidades_vendidas": round(total_unidades, 2),
+            "ticket_medio": ticket_medio,
+            "resumos_por_dia": registros
+        }
     }
 
 
