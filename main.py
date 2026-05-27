@@ -1550,3 +1550,300 @@ def db_ranking_periodo(
         "limite": limite,
         "dados": calculado["ranking"][:limite]
     }
+
+# ============================================================
+# ESTOQUE — busca produtos e estoque do Tiny
+# ============================================================
+
+def buscar_produtos_tiny_pagina(pagina: int = 1) -> Dict[str, Any]:
+    return tiny_get(
+        "produtos.pesquisa.php",
+        {
+            "pagina": pagina,
+            "situacao": "A"  # apenas ativos
+        }
+    )
+
+def buscar_todos_produtos_tiny() -> List[Dict[str, Any]]:
+    todos = []
+    pagina = 1
+
+    while True:
+        resposta = buscar_produtos_tiny_pagina(pagina)
+        retorno = resposta.get("retorno", {})
+        produtos_raw = retorno.get("produtos", [])
+
+        for item in produtos_raw:
+            produto = item.get("produto", item)
+            todos.append(produto)
+
+        numero_paginas = int(retorno.get("numero_paginas", 1) or 1)
+        if pagina >= numero_paginas:
+            break
+
+        pagina += 1
+        time.sleep(0.5)
+
+    return todos
+
+def obter_estoque_produto_tiny(id_produto: str) -> float:
+    try:
+        resposta = tiny_get(
+            "produto.obter.php",
+            {"id": id_produto}
+        )
+        retorno = resposta.get("retorno", {})
+        produto = retorno.get("produto", {})
+        saldo = produto.get("estoque", {})
+        if isinstance(saldo, dict):
+            return dinheiro_para_float(saldo.get("saldo_fisico_total", 0))
+        return dinheiro_para_float(saldo or 0)
+    except Exception:
+        return 0.0
+
+def salvar_produtos_supabase(produtos: List[Dict[str, Any]]):
+    if not produtos:
+        return
+    supabase_insert(
+        "produtos",
+        produtos,
+        upsert=True,
+        on_conflict="tiny_id"
+    )
+
+@app.post("/sync/estoque")
+def sync_estoque():
+    """
+    Busca todos os produtos ativos do Tiny, obtém o estoque de cada um
+    e salva na tabela produtos do Supabase.
+    """
+    validar_env()
+
+    produtos_tiny = buscar_todos_produtos_tiny()
+    produtos_normalizados = []
+
+    for p in produtos_tiny:
+        tiny_id = safe_str(p.get("id") or p.get("codigo") or "")
+        if not tiny_id:
+            continue
+
+        estoque_atual = dinheiro_para_float(
+            p.get("saldo_fisico_total")
+            or p.get("estoque_atual")
+            or p.get("saldo")
+            or 0
+        )
+
+        # Se estoque não veio na pesquisa, busca individual
+        if estoque_atual == 0 and tiny_id:
+            estoque_atual = obter_estoque_produto_tiny(tiny_id)
+            time.sleep(0.3)
+
+        produtos_normalizados.append({
+            "tiny_id": tiny_id,
+            "sku": safe_str(p.get("codigo") or p.get("id") or ""),
+            "nome": safe_str(p.get("nome") or p.get("descricao") or ""),
+            "unidade": safe_str(p.get("unidade") or "un"),
+            "preco": dinheiro_para_float(p.get("preco") or 0),
+            "estoque_atual": estoque_atual,
+            "situacao": safe_str(p.get("situacao") or "A"),
+            "updated_at": datetime.now().isoformat()
+        })
+
+    if produtos_normalizados:
+        salvar_produtos_supabase(produtos_normalizados)
+
+    return {
+        "status": "ok",
+        "total_produtos": len(produtos_normalizados),
+        "mensagem": f"{len(produtos_normalizados)} produtos sincronizados com estoque."
+    }
+
+
+@app.get("/estoque/alertas")
+def get_estoque_alertas():
+    """
+    Retorna produtos do Supabase que estão abaixo do estoque mínimo configurado.
+    Cruza tabela produtos com estoque_minimo_config.
+    """
+    validar_env()
+
+    # Busca produtos
+    produtos = supabase_get(
+        "produtos",
+        {
+            "select": "tiny_id,sku,nome,estoque_atual,unidade,preco",
+            "situacao": "eq.A",
+            "order": "nome.asc",
+            "limit": "1000"
+        }
+    )
+
+    # Busca configurações de estoque mínimo
+    try:
+        configs = supabase_get(
+            "estoque_minimo_config",
+            {
+                "select": "*",
+                "limit": "1000"
+            }
+        )
+        config_map = {c["sku"]: c for c in configs}
+    except Exception:
+        config_map = {}
+
+    alertas = []
+    todos = []
+
+    for p in produtos:
+        sku = p.get("sku") or p.get("tiny_id") or ""
+        config = config_map.get(sku, {})
+
+        estoque_atual = float(p.get("estoque_atual") or 0)
+        estoque_minimo = float(config.get("estoque_minimo") or 0)
+        quantidade_sugerida = float(config.get("quantidade_sugerida_compra") or 0)
+        fornecedor = config.get("fornecedor_principal") or ""
+        whatsapp = config.get("whatsapp_fornecedor") or ""
+
+        # Calcula status
+        if estoque_atual <= 0:
+            status = "Urgente"
+        elif estoque_minimo > 0 and estoque_atual < estoque_minimo:
+            status = "Comprar"
+        elif estoque_minimo > 0 and estoque_atual <= estoque_minimo * 1.2:
+            status = "Atenção"
+        else:
+            status = "Ok"
+
+        item = {
+            "sku": sku,
+            "produto": p.get("nome") or "",
+            "estoque_atual": estoque_atual,
+            "estoque_minimo": estoque_minimo,
+            "quantidade_sugerida_compra": quantidade_sugerida,
+            "fornecedor_principal": fornecedor,
+            "whatsapp_fornecedor": whatsapp,
+            "status": status,
+            "preco": float(p.get("preco") or 0),
+            "unidade": p.get("unidade") or "un"
+        }
+
+        todos.append(item)
+        if status != "Ok":
+            alertas.append(item)
+
+    # Ordena: Urgente > Comprar > Atenção
+    ordem = {"Urgente": 0, "Comprar": 1, "Atenção": 2, "Ok": 3}
+    alertas.sort(key=lambda x: ordem.get(x["status"], 99))
+
+    return {
+        "status": "ok",
+        "total_produtos": len(todos),
+        "total_alertas": len(alertas),
+        "alertas": alertas
+    }
+
+
+@app.get("/estoque/produtos")
+def get_estoque_produtos(
+    busca: Optional[str] = Query(None, description="Filtrar por nome ou SKU"),
+    apenas_alertas: bool = Query(False)
+):
+    """
+    Lista todos os produtos com estoque atual.
+    """
+    validar_env()
+
+    params: Dict[str, str] = {
+        "select": "tiny_id,sku,nome,estoque_atual,unidade,preco,situacao",
+        "situacao": "eq.A",
+        "order": "nome.asc",
+        "limit": "1000"
+    }
+
+    produtos = supabase_get("produtos", params)
+
+    # Filtro de busca
+    if busca:
+        busca_lower = busca.lower()
+        produtos = [
+            p for p in produtos
+            if busca_lower in (p.get("nome") or "").lower()
+            or busca_lower in (p.get("sku") or "").lower()
+        ]
+
+    # Busca configs de estoque mínimo
+    try:
+        configs = supabase_get("estoque_minimo_config", {"select": "*", "limit": "1000"})
+        config_map = {c["sku"]: c for c in configs}
+    except Exception:
+        config_map = {}
+
+    resultado = []
+    for p in produtos:
+        sku = p.get("sku") or p.get("tiny_id") or ""
+        config = config_map.get(sku, {})
+        estoque_atual = float(p.get("estoque_atual") or 0)
+        estoque_minimo = float(config.get("estoque_minimo") or 0)
+
+        if estoque_atual <= 0:
+            status = "Urgente"
+        elif estoque_minimo > 0 and estoque_atual < estoque_minimo:
+            status = "Comprar"
+        elif estoque_minimo > 0 and estoque_atual <= estoque_minimo * 1.2:
+            status = "Atenção"
+        else:
+            status = "Ok"
+
+        if apenas_alertas and status == "Ok":
+            continue
+
+        resultado.append({
+            "sku": sku,
+            "produto": p.get("nome") or "",
+            "estoque_atual": estoque_atual,
+            "estoque_minimo": estoque_minimo,
+            "quantidade_sugerida_compra": float(config.get("quantidade_sugerida_compra") or 0),
+            "fornecedor_principal": config.get("fornecedor_principal") or "",
+            "whatsapp_fornecedor": config.get("whatsapp_fornecedor") or "",
+            "status": status,
+            "preco": float(p.get("preco") or 0),
+            "unidade": p.get("unidade") or "un"
+        })
+
+    return {
+        "status": "ok",
+        "total": len(resultado),
+        "produtos": resultado
+    }
+
+
+@app.post("/estoque/config")
+def salvar_config_estoque(body: Dict[str, Any]):
+    """
+    Salva ou atualiza configuração de estoque mínimo para um produto.
+    Body: { sku, estoque_minimo, quantidade_sugerida_compra, fornecedor_principal, whatsapp_fornecedor }
+    """
+    validar_env()
+
+    sku = body.get("sku")
+    if not sku:
+        raise HTTPException(status_code=400, detail="SKU é obrigatório.")
+
+    payload = {
+        "sku": sku,
+        "estoque_minimo": float(body.get("estoque_minimo") or 0),
+        "quantidade_sugerida_compra": float(body.get("quantidade_sugerida_compra") or 0),
+        "fornecedor_principal": body.get("fornecedor_principal") or "",
+        "whatsapp_fornecedor": body.get("whatsapp_fornecedor") or "",
+        "updated_at": datetime.now().isoformat()
+    }
+
+    supabase_insert(
+        "estoque_minimo_config",
+        payload,
+        upsert=True,
+        on_conflict="sku"
+    )
+
+    return {"status": "ok", "mensagem": "Configuração salva com sucesso.", "sku": sku}
