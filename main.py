@@ -1847,3 +1847,18 @@ def salvar_config_estoque(body: Dict[str, Any]):
     )
 
     return {"status": "ok", "mensagem": "Configuração salva com sucesso.", "sku": sku}
+
+
+
+# ============================================================
+# ROTA TEMPORÁRIA — permite rodar sync de estoque pelo navegador
+# Pode remover depois que o sync inicial for feito
+# ============================================================
+
+@app.get("/sync/estoque-agora")
+def sync_estoque_agora():
+    """
+    Rota GET temporária para facilitar o primeiro sync de estoque.
+    Mesma lógica do POST /sync/estoque mas acessível pelo navegador.
+    """
+    return sync_estoque()
