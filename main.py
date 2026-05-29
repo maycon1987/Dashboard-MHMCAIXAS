@@ -1612,52 +1612,78 @@ def salvar_produtos_supabase(produtos: List[Dict[str, Any]]):
     )
 
 @app.post("/sync/estoque")
-def sync_estoque():
+def sync_estoque(pagina_inicio: int = Query(1, description="Página inicial"), pagina_fim: int = Query(5, description="Página final (máx 5 por vez)")):
     """
-    Busca todos os produtos ativos do Tiny, obtém o estoque de cada um
-    e salva na tabela produtos do Supabase.
+    Busca produtos do Tiny em lotes de páginas e salva no Supabase.
+    Chame várias vezes incrementando pagina_inicio para cobrir todos os produtos.
+    Exemplo: pagina_inicio=1&pagina_fim=5, depois 6&10, depois 11&15...
     """
     validar_env()
 
-    produtos_tiny = buscar_todos_produtos_tiny()
     produtos_normalizados = []
 
-    for p in produtos_tiny:
-        tiny_id = safe_str(p.get("id") or p.get("codigo") or "")
-        if not tiny_id:
-            continue
+    for pagina in range(pagina_inicio, pagina_fim + 1):
+        try:
+            resposta = buscar_produtos_tiny_pagina(pagina)
+            retorno = resposta.get("retorno", {})
+            produtos_raw = retorno.get("produtos", [])
 
-        estoque_atual = dinheiro_para_float(
-            p.get("saldo_fisico_total")
-            or p.get("estoque_atual")
-            or p.get("saldo")
-            or 0
-        )
+            if not produtos_raw:
+                break
 
-        # Se estoque não veio na pesquisa, busca individual
-        if estoque_atual == 0 and tiny_id:
-            estoque_atual = obter_estoque_produto_tiny(tiny_id)
-            time.sleep(0.3)
+            for item in produtos_raw:
+                p = item.get("produto", item)
+                tiny_id = safe_str(p.get("id") or p.get("codigo") or "")
+                if not tiny_id:
+                    continue
 
-        produtos_normalizados.append({
-            "tiny_id": tiny_id,
-            "sku": safe_str(p.get("codigo") or p.get("id") or ""),
-            "nome": safe_str(p.get("nome") or p.get("descricao") or ""),
-            "unidade": safe_str(p.get("unidade") or "un"),
-            "preco": dinheiro_para_float(p.get("preco") or 0),
-            "estoque_atual": estoque_atual,
-            "situacao": safe_str(p.get("situacao") or "A"),
-            "updated_at": datetime.now().isoformat()
-        })
+                estoque_atual = dinheiro_para_float(
+                    p.get("saldo_fisico_total")
+                    or p.get("estoque_atual")
+                    or p.get("saldo")
+                    or 0
+                )
+
+                produtos_normalizados.append({
+                    "tiny_id": tiny_id,
+                    "sku": safe_str(p.get("codigo") or p.get("id") or ""),
+                    "nome": safe_str(p.get("nome") or p.get("descricao") or ""),
+                    "unidade": safe_str(p.get("unidade") or "un"),
+                    "preco": dinheiro_para_float(p.get("preco") or 0),
+                    "estoque_atual": estoque_atual,
+                    "situacao": safe_str(p.get("situacao") or "A"),
+                    "updated_at": datetime.now().isoformat()
+                })
+
+            numero_paginas = int(retorno.get("numero_paginas", 1) or 1)
+            if pagina >= numero_paginas:
+                break
+
+            time.sleep(0.5)
+
+        except Exception as e:
+            return {
+                "status": "erro",
+                "pagina_com_erro": pagina,
+                "erro": str(e),
+                "salvos_antes": len(produtos_normalizados)
+            }
 
     if produtos_normalizados:
         salvar_produtos_supabase(produtos_normalizados)
 
     return {
         "status": "ok",
+        "paginas": f"{pagina_inicio} a {pagina_fim}",
         "total_produtos": len(produtos_normalizados),
-        "mensagem": f"{len(produtos_normalizados)} produtos sincronizados com estoque."
+        "mensagem": f"{len(produtos_normalizados)} produtos salvos. Se houver mais, rode a próxima página."
     }
+
+
+@app.get("/sync/estoque-agora")
+def sync_estoque_agora_get(pagina_inicio: int = Query(1), pagina_fim: int = Query(5)):
+    """Rota GET para rodar sync de estoque direto pelo navegador em lotes."""
+    return sync_estoque(pagina_inicio=pagina_inicio, pagina_fim=pagina_fim)
 
 
 @app.get("/estoque/alertas")
@@ -1850,18 +1876,7 @@ def salvar_config_estoque(body: Dict[str, Any]):
 
 
 
-# ============================================================
-# ROTA TEMPORÁRIA — permite rodar sync de estoque pelo navegador
-# Pode remover depois que o sync inicial for feito
-# ============================================================
 
-@app.get("/sync/estoque-agora")
-def sync_estoque_agora():
-    """
-    Rota GET temporária para facilitar o primeiro sync de estoque.
-    Mesma lógica do POST /sync/estoque mas acessível pelo navegador.
-    """
-    return sync_estoque()
 
 
 # ============================================================
