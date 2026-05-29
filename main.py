@@ -1872,14 +1872,27 @@ import threading
 def job_sync_diario():
     """
     Roda o sync do dia atual automaticamente a cada 1h.
+    Só executa entre 09:00 e 17:40 (horário de Brasília).
     Executa em background sem travar a API.
     """
     while True:
         try:
-            hoje = hoje_br()
-            print(f"[AUTO-SYNC] Iniciando sync do dia {hoje.isoformat()}...")
-            sincronizar_periodo(hoje, hoje, tipo="dia")
-            print(f"[AUTO-SYNC] Sync concluído: {hoje.isoformat()}")
+            agora = datetime.now()
+            hora_atual = agora.hour
+            minuto_atual = agora.minute
+            hora_minuto = hora_atual * 60 + minuto_atual  # em minutos
+
+            # Janela permitida: 09:00 (540min) até 17:40 (1060min)
+            dentro_horario = 540 <= hora_minuto <= 1060
+
+            if dentro_horario:
+                hoje = hoje_br()
+                print(f"[AUTO-SYNC] {agora.strftime('%H:%M')} - Iniciando sync do dia {hoje.isoformat()}...")
+                sincronizar_periodo(hoje, hoje, tipo="dia")
+                print(f"[AUTO-SYNC] Sync concluído: {hoje.isoformat()}")
+            else:
+                print(f"[AUTO-SYNC] {agora.strftime('%H:%M')} - Fora do horário comercial (09:00-17:40). Pulando sync.")
+
         except Exception as e:
             print(f"[AUTO-SYNC] Erro: {e}")
 
