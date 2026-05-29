@@ -1862,3 +1862,34 @@ def sync_estoque_agora():
     Mesma lógica do POST /sync/estoque mas acessível pelo navegador.
     """
     return sync_estoque()
+
+
+# ============================================================
+# AGENDADOR AUTOMÁTICO — sync a cada 1h no próprio Railway
+# ============================================================
+import threading
+
+def job_sync_diario():
+    """
+    Roda o sync do dia atual automaticamente a cada 1h.
+    Executa em background sem travar a API.
+    """
+    while True:
+        try:
+            hoje = hoje_br()
+            print(f"[AUTO-SYNC] Iniciando sync do dia {hoje.isoformat()}...")
+            sincronizar_periodo(hoje, hoje, tipo="dia")
+            print(f"[AUTO-SYNC] Sync concluído: {hoje.isoformat()}")
+        except Exception as e:
+            print(f"[AUTO-SYNC] Erro: {e}")
+
+        # Aguarda 1 hora antes do próximo sync
+        time.sleep(60 * 60)
+
+def iniciar_agendador():
+    thread = threading.Thread(target=job_sync_diario, daemon=True)
+    thread.start()
+    print("[AUTO-SYNC] Agendador iniciado — sync automático a cada 1h.")
+
+# Inicia o agendador quando o servidor sobe
+iniciar_agendador()
