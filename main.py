@@ -466,23 +466,26 @@ def buscar_pedidos_periodo_tiny(
 
 def pedido_tem_venda_valida(pedido: Dict[str, Any]) -> bool:
     """
-    Evita contar orçamento/cancelado quando o Tiny retorna situação.
-    Ajuste aqui depois se quiser filtrar outros status.
+    Conta APENAS pedidos com NF emitida (faturado e posteriores).
+    Status válidos: faturado, pronto para envio, enviado, entregue.
+    Status inválidos: em aberto, aprovado, cancelado, orcamento, etc.
     """
     situacao = str(pedido.get("situacao", "")).lower().strip()
 
-    status_invalidos = [
-        "cancelado",
-        "cancelada",
-        "orçamento",
-        "orcamento"
+    # Só conta se estiver em um desses status (NF emitida)
+    status_validos = [
+        "faturado",
+        "pronto para envio",
+        "enviado",
+        "entregue",
+        "faturada",
     ]
 
-    for invalido in status_invalidos:
-        if invalido in situacao:
-            return False
+    for valido in status_validos:
+        if valido in situacao:
+            return True
 
-    return True
+    return False
 
 
 def normalizar_pedido_resumo(pedido: Dict[str, Any]) -> Dict[str, Any]:
