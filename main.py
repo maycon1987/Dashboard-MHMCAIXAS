@@ -488,6 +488,49 @@ def pedido_tem_venda_valida(pedido: Dict[str, Any]) -> bool:
     return False
 
 
+
+def extrair_marcadores_pedido(pedido: Dict[str, Any]) -> List[str]:
+    """
+    Extrai os marcadores/tags do pedido retornado pelo Tiny.
+    Exemplo real do Tiny:
+    "marcadores": [{"marcador": {"descricao": "PDV"}}]
+    """
+    marcadores_raw = pedido.get("marcadores", []) or []
+    marcadores = []
+
+    for item in marcadores_raw:
+        marcador = item.get("marcador", item) if isinstance(item, dict) else {}
+        descricao = safe_str(marcador.get("descricao", "")).strip()
+        if descricao:
+            marcadores.append(descricao)
+
+    return marcadores
+
+
+def definir_canal_venda(pedido: Dict[str, Any]) -> str:
+    """
+    Regra MHM:
+    - Pedido com marcador/tag "PDV" = PDV
+    - Pedido sem marcador/tag "PDV" = COMERCIAL
+    """
+    marcadores = extrair_marcadores_pedido(pedido)
+
+    for marcador in marcadores:
+        if marcador.strip().upper() == "PDV":
+            return "PDV"
+
+    return "COMERCIAL"
+
+
+def extrair_nome_cliente(pedido: Dict[str, Any]) -> str:
+    cliente = pedido.get("cliente")
+
+    if isinstance(cliente, dict):
+        return safe_str(cliente.get("nome") or cliente.get("nome_fantasia") or "")
+
+    return safe_str(pedido.get("nome") or pedido.get("cliente") or "")
+
+
 def normalizar_pedido_resumo(pedido: Dict[str, Any]) -> Dict[str, Any]:
     id_pedido = safe_str(
         pedido.get("id")
@@ -509,20 +552,32 @@ def normalizar_pedido_resumo(pedido: Dict[str, Any]) -> Dict[str, Any]:
         or 0
     )
 
-    cliente = pedido.get("nome") or pedido.get("cliente") or ""
+    marcadores = extrair_marcadores_pedido(pedido)
+    canal_venda = definir_canal_venda(pedido)
 
     return {
         "tiny_id": id_pedido,
         "numero": safe_str(pedido.get("numero", "")),
         "numero_ecommerce": safe_str(pedido.get("numero_ecommerce", "")),
         "data_pedido": data_pedido_iso,
-        "cliente": cliente,
-        "situacao": pedido.get("situacao", ""),
+        "cliente": extrair_nome_cliente(pedido),
+        "situacao": safe_str(pedido.get("situacao", "")),
         "valor_total": valor,
+
+        # Campos para separar PDV x Comercial
+        "marcadores": marcadores,
+        "canal_venda": canal_venda,
+
+        # Campos úteis para próximos indicadores
+        "id_vendedor": safe_str(pedido.get("id_vendedor", "")),
+        "nome_vendedor": safe_str(pedido.get("nome_vendedor", "")),
+        "forma_pagamento": safe_str(pedido.get("forma_pagamento", "")),
+        "meio_pagamento": safe_str(pedido.get("meio_pagamento", "")),
+
+        # Mantém o JSON completo para auditoria/debug
         "raw": pedido,
         "updated_at": datetime.now().isoformat()
     }
-
 
 def extrair_itens_do_pedido_completo(
     pedido_completo: Dict[str, Any],
@@ -715,7 +770,27 @@ def sincronizar_periodo(
         if not pedido_tem_venda_valida(pedido_raw):
             continue
 
-        pedido_norm = normalizar_pedido_resumo(pedido_raw)
+        # Primeiro pega o detalhe completo do pedido.
+        # É no pedido.obter.php que o Tiny retorna "marcadores", incluindo a TAG "PDV".
+        pedido_completo = None
+        pedido_detalhado = pedido_raw
+
+        id_para_obter = safe_str(
+            pedido_raw.get("id")
+            or pedido_raw.get("numero")
+            or pedido_raw.get("numero_ecommerce")
+            or ""
+        )
+
+        if id_para_obter:
+            try:
+                pedido_completo = obter_pedido_tiny(id_para_obter)
+                pedido_detalhado = pedido_completo.get("retorno", {}).get("pedido", pedido_raw)
+                time.sleep(0.7)
+            except Exception:
+                pedido_detalhado = pedido_raw
+
+        pedido_norm = normalizar_pedido_resumo(pedido_detalhado)
 
         if not pedido_norm.get("tiny_id"):
             continue
@@ -727,14 +802,16 @@ def sincronizar_periodo(
 
         if buscar_itens:
             try:
-                pedido_completo = obter_pedido_tiny(pedido_norm["tiny_id"])
+                if not pedido_completo:
+                    pedido_completo = obter_pedido_tiny(pedido_norm["tiny_id"])
+                    time.sleep(0.7)
+
                 itens = extrair_itens_do_pedido_completo(
                     pedido_completo,
                     pedido_norm["tiny_id"],
                     pedido_norm["data_pedido"]
                 )
                 itens_normalizados.extend(itens)
-                time.sleep(0.7)
             except Exception:
                 continue
 
@@ -920,9 +997,14 @@ class PeriodoBody(BaseModel):
 # ROTAS BÁSICAS
 # ============================================================
 
-@app.get("/teste-pedido/{id_pedido}")
-def teste_pedido(id_pedido: str):
-    return obter_pedido_tiny(id_pedido)
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "app": "MHM Dashboard Tiny API",
+        "version": "2.0.1"
+    }
+
 
 @app.get("/health")
 def health():
@@ -951,6 +1033,7 @@ def rotas():
             "/db/dashboard-resumo",
             "/db/resumo-periodo",
             "/db/ranking-periodo",
+            "/db/faturamento-canais",
             "/db/sync-logs"
         ],
         "configuracoes": [
@@ -1548,6 +1631,70 @@ def db_ranking_periodo(
         "limite": limite,
         "dados": calculado["ranking"][:limite]
     }
+
+
+@app.get("/db/faturamento-canais")
+def db_faturamento_canais(
+    data_inicio: str = Query(..., description="YYYY-MM-DD"),
+    data_fim: str = Query(..., description="YYYY-MM-DD")
+):
+    inicio = parse_data(data_inicio)
+    fim = parse_data(data_fim)
+
+    if fim < inicio:
+        raise HTTPException(
+            status_code=400,
+            detail="data_fim não pode ser menor que data_inicio."
+        )
+
+    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim)
+
+    resultado = {
+        "PDV": {
+            "pedidos": 0,
+            "faturamento": 0.0,
+            "ticket_medio": 0.0,
+            "percentual": 0.0
+        },
+        "COMERCIAL": {
+            "pedidos": 0,
+            "faturamento": 0.0,
+            "ticket_medio": 0.0,
+            "percentual": 0.0
+        }
+    }
+
+    for pedido in pedidos:
+        canal = safe_str(pedido.get("canal_venda") or "COMERCIAL").upper()
+
+        if canal not in resultado:
+            canal = "COMERCIAL"
+
+        resultado[canal]["pedidos"] += 1
+        resultado[canal]["faturamento"] += float(pedido.get("valor_total") or 0)
+
+    total = round(
+        resultado["PDV"]["faturamento"] + resultado["COMERCIAL"]["faturamento"],
+        2
+    )
+
+    for canal in resultado:
+        qtd = resultado[canal]["pedidos"]
+        faturamento = resultado[canal]["faturamento"]
+
+        resultado[canal]["faturamento"] = round(faturamento, 2)
+        resultado[canal]["ticket_medio"] = round(faturamento / qtd, 2) if qtd else 0.0
+        resultado[canal]["percentual"] = round((faturamento / total * 100), 2) if total else 0.0
+
+    return {
+        "status": "ok",
+        "data_inicio": inicio.isoformat(),
+        "data_fim": fim.isoformat(),
+        "pdv": resultado["PDV"],
+        "comercial": resultado["COMERCIAL"],
+        "total": total
+    }
+
 
 # ============================================================
 # ESTOQUE — busca produtos e estoque do Tiny
