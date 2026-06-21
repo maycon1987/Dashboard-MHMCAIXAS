@@ -920,14 +920,9 @@ class PeriodoBody(BaseModel):
 # ROTAS BÁSICAS
 # ============================================================
 
-@app.get("/")
-def home():
-    return {
-        "status": "online",
-        "app": "MHM Dashboard Tiny API",
-        "version": "2.0.1"
-    }
-
+@app.get("/teste-pedido/{id_pedido}")
+def teste_pedido(id_pedido: str):
+    return obter_pedido_tiny(id_pedido)
 
 @app.get("/health")
 def health():
