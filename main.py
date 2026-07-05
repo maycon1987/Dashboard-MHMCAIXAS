@@ -345,15 +345,31 @@ def buscar_configuracao(chave: str) -> Optional[str]:
 # TINY
 # ============================================================
 
-def tiny_get(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def obter_token_tiny(filial: str = "sp") -> str:
+    """
+    Retorna o token Tiny conforme a filial.
+    """
+
+    filial = (filial or "sp").lower().strip()
+
+    if filial in ["mg", "minas", "pouso_alegre"]:
+        if not TINY_API_KEY_MINAS:
+            raise HTTPException(
+                status_code=500,
+                detail="TINY_API_KEY_MINAS não configurado."
+            )
+        return TINY_API_KEY_MINAS
+
+    return TINY_TOKEN
+def tiny_get(endpoint: str, params: Dict[str, Any], filial: str = "sp") -> Dict[str, Any]:
     validar_env()
 
     url = f"{TINY_BASE_URL}/{endpoint}"
 
     params_base = {
-        "token": TINY_TOKEN,
-        "formato": "json",
-    }
+    "token": obter_token_tiny(filial),
+    "formato": "json",
+}
 
     params_base.update(params)
 
