@@ -28,12 +28,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ============================================================
 # ENV
 # ============================================================
 
 TINY_TOKEN = os.getenv("TINY_TOKEN", "").strip()
+TINY_API_KEY_MINAS = os.getenv("TINY_API_KEY_MINAS", "").strip()
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 
 # Aceita os dois nomes, para não quebrar se o Railway tiver uma ou outra variável
@@ -43,7 +44,6 @@ SUPABASE_SERVICE_ROLE_KEY = (
 )
 
 TINY_BASE_URL = "https://api.tiny.com.br/api2"
-
 
 # ============================================================
 # HELPERS GERAIS
