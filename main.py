@@ -1091,11 +1091,11 @@ def rotas():
 
 @app.post("/sync/tiny-dia")
 def sync_tiny_dia(
-    data: str = Query(..., description="Data no formato YYYY-MM-DD")
+    data: str = Query(..., description="Data no formato YYYY-MM-DD"),
+    filial: str = Query("sp", description="sp ou mg")
 ):
     data_ref = parse_data(data)
-    return sincronizar_periodo(data_ref, data_ref, tipo="dia")
-
+    return sincronizar_periodo(data_ref, data_ref, tipo="dia", filial=filial)
 
 @app.post("/sync/tiny-mes")
 def sync_tiny_mes(
