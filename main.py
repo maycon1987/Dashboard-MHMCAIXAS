@@ -1133,8 +1133,16 @@ def sync_tiny_periodo(
     body: PeriodoBody,
     filial: str = Query("sp", description="sp ou mg")
 ):
+    data_inicio = parse_data(body.data_inicio)
+    data_fim = parse_data(body.data_fim)
 
-    return sincronizar_periodo(data_inicio, data_fim, tipo="periodo")
+    if data_fim < data_inicio:
+        raise HTTPException(
+            status_code=400,
+            detail="data_fim não pode ser menor que data_inicio."
+        )
+
+    return sincronizar_periodo(data_inicio, data_fim, tipo="periodo", filial=filial)
 
 
 @app.post("/sync/descobrir-data-inicial-tiny")
