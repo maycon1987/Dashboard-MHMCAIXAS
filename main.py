@@ -414,28 +414,34 @@ def tiny_get(endpoint: str, params: Dict[str, Any], filial: str = "sp") -> Dict[
 def pesquisar_pedidos_tiny(
     data_inicial: date,
     data_final: date,
-    pagina: int = 1
+    pagina: int = 1,
+    filial: str = "sp"
 ) -> Dict[str, Any]:
     """
     Pesquisa pedidos no Tiny por período.
     """
     return tiny_get(
-        "pedidos.pesquisa.php",
-        {
-            "dataInicial": data_inicial.strftime("%d/%m/%Y"),
-            "dataFinal": data_final.strftime("%d/%m/%Y"),
-            "pagina": pagina
-        }
-    )
+    "pedidos.pesquisa.php",
+    {
+        "dataInicial": data_inicial.strftime("%d/%m/%Y"),
+        "dataFinal": data_final.strftime("%d/%m/%Y"),
+        "pagina": pagina
+    },
+    filial=filial
+)
 
 
-def obter_pedido_tiny(id_pedido: str) -> Dict[str, Any]:
+def obter_pedido_tiny(
+    id_pedido: str,
+    filial: str = "sp"
+) -> Dict[str, Any]:
     return tiny_get(
-        "pedido.obter.php",
-        {
-            "id": id_pedido
-        }
-    )
+    "pedido.obter.php",
+    {
+        "id": id_pedido
+    },
+    filial=filial
+)
 
 
 def extrair_lista_pedidos(resposta_tiny: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -454,8 +460,9 @@ def extrair_lista_pedidos(resposta_tiny: Dict[str, Any]) -> List[Dict[str, Any]]
 def buscar_pedidos_periodo_tiny(
     data_inicial: date,
     data_final: date,
-    pausa_segundos: float = 0.8
-) -> List[Dict[str, Any]]:
+    pausa_segundos: float = 0.8,
+    filial: str = "sp"
+): -> List[Dict[str, Any]]:
     """
     Busca pedidos paginando.
     """
@@ -463,7 +470,12 @@ def buscar_pedidos_periodo_tiny(
     pagina = 1
 
     while True:
-        resposta = pesquisar_pedidos_tiny(data_inicial, data_final, pagina)
+        resposta = pesquisar_pedidos_tiny(
+    data_inicial,
+    data_final,
+    pagina,
+    filial=filial
+)
         retorno = resposta.get("retorno", {})
 
         pedidos = extrair_lista_pedidos(resposta)
@@ -547,7 +559,10 @@ def extrair_nome_cliente(pedido: Dict[str, Any]) -> str:
     return safe_str(pedido.get("nome") or pedido.get("cliente") or "")
 
 
-def normalizar_pedido_resumo(pedido: Dict[str, Any]) -> Dict[str, Any]:
+def normalizar_pedido_resumo(
+    pedido: Dict[str, Any],
+    filial: str = "sp"
+) -> Dict[str, Any]:
     id_pedido = safe_str(
         pedido.get("id")
         or pedido.get("numero")
@@ -572,28 +587,27 @@ def normalizar_pedido_resumo(pedido: Dict[str, Any]) -> Dict[str, Any]:
     canal_venda = definir_canal_venda(pedido)
 
     return {
-        "tiny_id": id_pedido,
-        "numero": safe_str(pedido.get("numero", "")),
-        "numero_ecommerce": safe_str(pedido.get("numero_ecommerce", "")),
-        "data_pedido": data_pedido_iso,
-        "cliente": extrair_nome_cliente(pedido),
-        "situacao": safe_str(pedido.get("situacao", "")),
-        "valor_total": valor,
+    "tiny_id": id_pedido,
+    "numero": safe_str(pedido.get("numero", "")),
+    "numero_ecommerce": safe_str(pedido.get("numero_ecommerce", "")),
+    "data_pedido": data_pedido_iso,
+    "cliente": extrair_nome_cliente(pedido),
+    "situacao": safe_str(pedido.get("situacao", "")),
+    "valor_total": valor,
 
-        # Campos para separar PDV x Comercial
-        "marcadores": marcadores,
-        "canal_venda": canal_venda,
+    "marcadores": marcadores,
+    "canal_venda": canal_venda,
 
-        # Campos úteis para próximos indicadores
-        "id_vendedor": safe_str(pedido.get("id_vendedor", "")),
-        "nome_vendedor": safe_str(pedido.get("nome_vendedor", "")),
-        "forma_pagamento": safe_str(pedido.get("forma_pagamento", "")),
-        "meio_pagamento": safe_str(pedido.get("meio_pagamento", "")),
+    "filial": filial,
 
-        # Mantém o JSON completo para auditoria/debug
-        "raw": pedido,
-        "updated_at": datetime.now().isoformat()
-    }
+    "id_vendedor": safe_str(pedido.get("id_vendedor", "")),
+    "nome_vendedor": safe_str(pedido.get("nome_vendedor", "")),
+    "forma_pagamento": safe_str(pedido.get("forma_pagamento", "")),
+    "meio_pagamento": safe_str(pedido.get("meio_pagamento", "")),
+
+    "raw": pedido,
+    "updated_at": datetime.now().isoformat()
+}
 
 def extrair_itens_do_pedido_completo(
     pedido_completo: Dict[str, Any],
@@ -771,13 +785,18 @@ def sincronizar_periodo(
     data_inicio: date,
     data_fim: date,
     tipo: str = "periodo",
-    buscar_itens: bool = True
+    buscar_itens: bool = True,
+    filial: str = "sp"
 ) -> Dict[str, Any]:
     """
     Busca pedidos no Tiny, salva pedidos, itens e resumos no Supabase.
     """
 
-    pedidos_tiny = buscar_pedidos_periodo_tiny(data_inicio, data_fim)
+    pedidos_tiny = buscar_pedidos_periodo_tiny(
+    data_inicio,
+    data_fim,
+    filial=filial
+)
 
     pedidos_normalizados = []
     itens_normalizados = []
@@ -800,14 +819,19 @@ def sincronizar_periodo(
 
         if id_para_obter:
             try:
-                pedido_completo = obter_pedido_tiny(id_para_obter)
+                pedido_completo = obter_pedido_tiny(
+    id_para_obter,
+    filial=filial
+)
                 pedido_detalhado = pedido_completo.get("retorno", {}).get("pedido", pedido_raw)
                 time.sleep(0.7)
             except Exception:
                 pedido_detalhado = pedido_raw
 
-        pedido_norm = normalizar_pedido_resumo(pedido_detalhado)
-
+        pedido_norm = normalizar_pedido_resumo(
+    pedido_detalhado,
+    filial=filial
+)
         if not pedido_norm.get("tiny_id"):
             continue
 
@@ -819,7 +843,10 @@ def sincronizar_periodo(
         if buscar_itens:
             try:
                 if not pedido_completo:
-                    pedido_completo = obter_pedido_tiny(pedido_norm["tiny_id"])
+                    pedido_completo = obter_pedido_tiny(
+    pedido_norm["tiny_id"],
+    filial=filial
+)
                     time.sleep(0.7)
 
                 itens = extrair_itens_do_pedido_completo(
