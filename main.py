@@ -341,6 +341,31 @@ def buscar_configuracao(chave: str) -> Optional[str]:
     return resultado[0].get("valor")
 
 
+def normalizar_filial(filial: str = "sp") -> str:
+    """
+    Padroniza filial para uso no backend.
+    sp  = Campinas
+    mg  = Minas/Pouso Alegre
+    all = consolidado
+    """
+    filial = (filial or "sp").lower().strip()
+
+    if filial in ["all", "todas", "todos", "consolidado"]:
+        return "all"
+
+    if filial in ["mg", "minas", "pouso_alegre", "pouso-alegre"]:
+        return "mg"
+
+    return "sp"
+
+
+def adicionar_filtro_filial_params(params: List[Any], filial: str = "sp") -> List[Any]:
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params.append(("filial", f"eq.{filial_normalizada}"))
+    return params
+
+
 # ============================================================
 # TINY
 # ============================================================
@@ -361,15 +386,17 @@ def obter_token_tiny(filial: str = "sp") -> str:
         return TINY_API_KEY_MINAS
 
     return TINY_TOKEN
+
+
 def tiny_get(endpoint: str, params: Dict[str, Any], filial: str = "sp") -> Dict[str, Any]:
     validar_env()
 
     url = f"{TINY_BASE_URL}/{endpoint}"
 
     params_base = {
-    "token": obter_token_tiny(filial),
-    "formato": "json",
-}
+        "token": obter_token_tiny(filial),
+        "formato": "json",
+    }
 
     params_base.update(params)
 
@@ -612,7 +639,8 @@ def normalizar_pedido_resumo(
 def extrair_itens_do_pedido_completo(
     pedido_completo: Dict[str, Any],
     pedido_id: str,
-    data_pedido: Optional[str]
+    data_pedido: Optional[str],
+    filial: str = "sp"
 ) -> List[Dict[str, Any]]:
     retorno = pedido_completo.get("retorno", {})
     pedido = retorno.get("pedido", {})
@@ -633,6 +661,7 @@ def extrair_itens_do_pedido_completo(
         itens.append({
     "pedido_tiny_id": safe_str(pedido_id),
     "data_pedido": data_pedido,
+    "filial": filial,
 
     # Mantém compatibilidade com banco novo e banco antigo
     "produto_nome": produto_nome,
@@ -716,7 +745,8 @@ def salvar_sync_log(
     status: str,
     mensagem: str,
     total_pedidos: int = 0,
-    faturamento: float = 0.0
+    faturamento: float = 0.0,
+    filial: str = "sp"
 ):
     payload = {
         "tipo": tipo,
@@ -726,6 +756,7 @@ def salvar_sync_log(
         "mensagem": mensagem,
         "total_pedidos": total_pedidos,
         "faturamento": faturamento,
+        "filial": normalizar_filial(filial),
         "created_at": datetime.now().isoformat()
     }
 
@@ -769,14 +800,15 @@ def limpar_itens_dos_pedidos(pedidos_normalizados: List[Dict[str, Any]]):
             pass
 
 
-def limpar_ranking_periodo(data_inicio: date, data_fim: date, tipo: str):
+def limpar_ranking_periodo(data_inicio: date, data_fim: date, tipo: str, filial: str = "sp"):
     try:
         supabase_delete(
             "ranking_periodo",
             {
                 "data_inicio": f"eq.{data_inicio.isoformat()}",
                 "data_fim": f"eq.{data_fim.isoformat()}",
-                "tipo": f"eq.{tipo}"
+                "tipo": f"eq.{tipo}",
+                "filial": f"eq.{normalizar_filial(filial)}"
             }
         )
     except Exception:
@@ -852,7 +884,8 @@ def sincronizar_periodo(
                 itens = extrair_itens_do_pedido_completo(
                     pedido_completo,
                     pedido_norm["tiny_id"],
-                    pedido_norm["data_pedido"]
+                    pedido_norm["data_pedido"],
+                    filial=filial
                 )
                 itens_normalizados.extend(itens)
             except Exception:
@@ -929,6 +962,7 @@ def sincronizar_periodo(
             "total_unidades_vendidas": unidades_dia,
             "total_produtos_diferentes": produtos_diferentes,
             "origem": "Tiny/Olist",
+            "filial": normalizar_filial(filial),
             "updated_at": datetime.now().isoformat()
         }
 
@@ -937,7 +971,7 @@ def sincronizar_periodo(
                 "resumo_diario",
                 resumo_diario_payload,
                 upsert=True,
-                on_conflict="data_resumo"
+                on_conflict="data_resumo,filial"
             )
         except Exception:
             pass
@@ -951,6 +985,7 @@ def sincronizar_periodo(
             "faturamento": calculado["faturamento"],
             "total_pedidos": calculado["total_pedidos"],
             "ticket_medio": calculado["ticket_medio"],
+            "filial": normalizar_filial(filial),
             "updated_at": datetime.now().isoformat()
         }
 
@@ -968,6 +1003,7 @@ def sincronizar_periodo(
             "faturamento": calculado["faturamento"],
             "total_pedidos": calculado["total_pedidos"],
             "ticket_medio": calculado["ticket_medio"],
+            "filial": normalizar_filial(filial),
             "updated_at": datetime.now().isoformat()
         }
 
@@ -990,11 +1026,12 @@ def sincronizar_periodo(
             "quantidade_total": item["quantidade_total"],
             "valor_total": item["valor_total"],
             "percentual_participacao": item["percentual_participacao"],
+            "filial": normalizar_filial(filial),
             "updated_at": datetime.now().isoformat()
         })
 
     if ranking_periodo_payload:
-        limpar_ranking_periodo(data_inicio, data_fim, tipo)
+        limpar_ranking_periodo(data_inicio, data_fim, tipo, filial=filial)
 
         try:
             supabase_insert(
@@ -1012,7 +1049,8 @@ def sincronizar_periodo(
         status="ok",
         mensagem="Sincronização concluída.",
         total_pedidos=calculado["total_pedidos"],
-        faturamento=calculado["faturamento"]
+        faturamento=calculado["faturamento"],
+        filial=filial
     )
 
     return {
@@ -1023,6 +1061,7 @@ def sincronizar_periodo(
         "total_pedidos": calculado["total_pedidos"],
         "faturamento": calculado["faturamento"],
         "ticket_medio": calculado["ticket_medio"],
+        "filial": normalizar_filial(filial),
         "top_10": calculado["ranking"][:10]
     }
 
@@ -1349,7 +1388,8 @@ def get_data_inicio_tiny():
 
 def buscar_pedidos_banco_periodo_corrigido(
     data_inicio: date,
-    data_fim: date
+    data_fim: date,
+    filial: str = "sp"
 ) -> List[Dict[str, Any]]:
     validar_env()
 
@@ -1361,6 +1401,8 @@ def buscar_pedidos_banco_periodo_corrigido(
         ("data_pedido", f"lte.{data_fim.isoformat()}"),
         ("order", "data_pedido.asc")
     ]
+    params = adicionar_filtro_filial_params(params, filial)
+    params = adicionar_filtro_filial_params(params, filial)
 
     response = requests.get(
         url,
@@ -1384,7 +1426,8 @@ def buscar_pedidos_banco_periodo_corrigido(
 
 def buscar_itens_banco_periodo_corrigido(
     data_inicio: date,
-    data_fim: date
+    data_fim: date,
+    filial: str = "sp"
 ) -> List[Dict[str, Any]]:
     validar_env()
 
@@ -1419,10 +1462,11 @@ def buscar_itens_banco_periodo_corrigido(
 
 def calcular_resumo_periodo_banco(
     data_inicio: date,
-    data_fim: date
+    data_fim: date,
+    filial: str = "sp"
 ) -> Dict[str, Any]:
-    pedidos = buscar_pedidos_banco_periodo_corrigido(data_inicio, data_fim)
-    itens = buscar_itens_banco_periodo_corrigido(data_inicio, data_fim)
+    pedidos = buscar_pedidos_banco_periodo_corrigido(data_inicio, data_fim, filial=filial)
+    itens = buscar_itens_banco_periodo_corrigido(data_inicio, data_fim, filial=filial)
 
     calculado = calcular_resumo_e_ranking(
         pedidos=pedidos,
@@ -1446,7 +1490,8 @@ def calcular_resumo_periodo_banco(
 
 @app.get("/db/resumo-diario")
 def db_resumo_diario(
-    data: Optional[str] = Query(None)
+    data: Optional[str] = Query(None),
+    filial: str = Query("sp", description="sp, mg ou all")
 ):
     params = {
         "select": "*",
@@ -1455,6 +1500,10 @@ def db_resumo_diario(
 
     if data:
         params["data"] = f"eq.{data}"
+
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params["filial"] = f"eq.{filial_normalizada}"
 
     return {
         "status": "ok",
@@ -1465,7 +1514,8 @@ def db_resumo_diario(
 @app.get("/db/resumo-mensal")
 def db_resumo_mensal(
     ano: Optional[int] = Query(None),
-    mes: Optional[int] = Query(None)
+    mes: Optional[int] = Query(None),
+    filial: str = Query("sp", description="sp, mg ou all")
 ):
     params = {
         "select": "*",
@@ -1478,6 +1528,10 @@ def db_resumo_mensal(
     if mes:
         params["mes"] = f"eq.{mes}"
 
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params["filial"] = f"eq.{filial_normalizada}"
+
     return {
         "status": "ok",
         "dados": supabase_get("resumo_mensal", params)
@@ -1486,7 +1540,8 @@ def db_resumo_mensal(
 
 @app.get("/db/resumo-anual")
 def db_resumo_anual(
-    ano: Optional[int] = Query(None)
+    ano: Optional[int] = Query(None),
+    filial: str = Query("sp", description="sp, mg ou all")
 ):
     params = {
         "select": "*",
@@ -1496,6 +1551,10 @@ def db_resumo_anual(
     if ano:
         params["ano"] = f"eq.{ano}"
 
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params["filial"] = f"eq.{filial_normalizada}"
+
     return {
         "status": "ok",
         "dados": supabase_get("resumo_anual", params)
@@ -1503,27 +1562,38 @@ def db_resumo_anual(
 
 
 @app.get("/db/dashboard-resumo")
-def db_dashboard_resumo():
+def db_dashboard_resumo(
+    filial: str = Query("sp", description="sp, mg ou all")
+):
     hoje = hoje_br()
     inicio_30 = hoje - timedelta(days=30)
 
+    params_hoje = {
+        "data": f"eq.{hoje.isoformat()}",
+        "select": "*",
+        "limit": "1"
+    }
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params_hoje["filial"] = f"eq.{filial_normalizada}"
+
     resumo_hoje = supabase_get(
         "resumo_diario",
-        {
-            "data": f"eq.{hoje.isoformat()}",
-            "select": "*",
-            "limit": "1"
-        }
+        params_hoje
     )
+
+    params_mes = {
+        "ano": f"eq.{hoje.year}",
+        "mes": f"eq.{hoje.month}",
+        "select": "*",
+        "limit": "1"
+    }
+    if filial_normalizada != "all":
+        params_mes["filial"] = f"eq.{filial_normalizada}"
 
     resumo_mes = supabase_get(
         "resumo_mensal",
-        {
-            "ano": f"eq.{hoje.year}",
-            "mes": f"eq.{hoje.month}",
-            "select": "*",
-            "limit": "1"
-        }
+        params_mes
     )
 
     ultimos_logs = supabase_get(
@@ -1535,7 +1605,7 @@ def db_dashboard_resumo():
         }
     )
 
-    resumo_30 = calcular_resumo_periodo_banco(inicio_30, hoje)
+    resumo_30 = calcular_resumo_periodo_banco(inicio_30, hoje, filial=filial)
 
     return {
         "status": "ok",
@@ -1566,7 +1636,8 @@ def db_sync_logs(
 @app.get("/db/resumo-periodo")
 def db_resumo_periodo(
     data_inicio: str = Query(..., description="YYYY-MM-DD"),
-    data_fim: str = Query(..., description="YYYY-MM-DD")
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: str = Query("sp", description="sp, mg ou all")
 ):
     inicio = parse_data(data_inicio)
     fim = parse_data(data_fim)
@@ -1603,6 +1674,7 @@ def db_resumo_periodo(
         ("order", "data_resumo.asc"),
         ("limit", "1000"),
     ]
+    params = adicionar_filtro_filial_params(params, filial)
     resp = requests.get(url, headers=supabase_headers(), params=params, timeout=60)
     if resp.status_code >= 400:
         raise HTTPException(
@@ -1651,7 +1723,8 @@ def db_resumo_periodo(
 def db_ranking_periodo(
     data_inicio: str = Query(..., description="YYYY-MM-DD"),
     data_fim: str = Query(..., description="YYYY-MM-DD"),
-    limite: int = Query(10)
+    limite: int = Query(10),
+    filial: str = Query("sp", description="sp, mg ou all")
 ):
     inicio = parse_data(data_inicio)
     fim = parse_data(data_fim)
@@ -1662,8 +1735,8 @@ def db_ranking_periodo(
             detail="data_fim não pode ser menor que data_inicio."
         )
 
-    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim)
-    itens = buscar_itens_banco_periodo_corrigido(inicio, fim)
+    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim, filial=filial)
+    itens = buscar_itens_banco_periodo_corrigido(inicio, fim, filial=filial)
 
     calculado = calcular_resumo_e_ranking(
         pedidos=pedidos,
@@ -1684,7 +1757,8 @@ def db_ranking_periodo(
 @app.get("/db/faturamento-canais")
 def db_faturamento_canais(
     data_inicio: str = Query(..., description="YYYY-MM-DD"),
-    data_fim: str = Query(..., description="YYYY-MM-DD")
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: str = Query("sp", description="sp, mg ou all")
 ):
     inicio = parse_data(data_inicio)
     fim = parse_data(data_fim)
@@ -1695,7 +1769,7 @@ def db_faturamento_canais(
             detail="data_fim não pode ser menor que data_inicio."
         )
 
-    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim)
+    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim, filial=filial)
 
     resultado = {
         "PDV": {
@@ -1738,6 +1812,7 @@ def db_faturamento_canais(
         "status": "ok",
         "data_inicio": inicio.isoformat(),
         "data_fim": fim.isoformat(),
+        "filial": normalizar_filial(filial),
         "pdv": resultado["PDV"],
         "comercial": resultado["COMERCIAL"],
         "total": total
