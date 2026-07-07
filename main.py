@@ -462,7 +462,7 @@ def buscar_pedidos_periodo_tiny(
     data_final: date,
     pausa_segundos: float = 0.8,
     filial: str = "sp"
-): -> List[Dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     """
     Busca pedidos paginando.
     """
