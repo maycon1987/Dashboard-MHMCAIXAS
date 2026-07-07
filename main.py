@@ -1100,7 +1100,8 @@ def sync_tiny_dia(
 @app.post("/sync/tiny-mes")
 def sync_tiny_mes(
     ano: int = Query(...),
-    mes: int = Query(...)
+    mes: int = Query(...),
+    filial: str = Query("sp", description="sp ou mg")
 ):
     if mes < 1 or mes > 12:
         raise HTTPException(status_code=400, detail="Mês inválido.")
@@ -1109,12 +1110,13 @@ def sync_tiny_mes(
     ultimo_dia = monthrange(ano, mes)[1]
     data_fim = date(ano, mes, ultimo_dia)
 
-    return sincronizar_periodo(data_inicio, data_fim, tipo="mes")
+    return sincronizar_periodo(data_inicio, data_fim, tipo="mes", filial=filial)
 
 
 @app.post("/sync/tiny-ano")
 def sync_tiny_ano(
-    ano: int = Query(...)
+    ano: int = Query(...),
+    filial: str = Query("sp", description="sp ou mg")
 ):
     data_inicio = date(ano, 1, 1)
     data_fim = date(ano, 12, 31)
@@ -1123,19 +1125,14 @@ def sync_tiny_ano(
     if data_fim > hoje:
         data_fim = hoje
 
-    return sincronizar_periodo(data_inicio, data_fim, tipo="ano")
+    return sincronizar_periodo(data_inicio, data_fim, tipo="ano", filial=filial)
 
 
 @app.post("/sync/tiny-periodo")
-def sync_tiny_periodo(body: PeriodoBody):
-    data_inicio = parse_data(body.data_inicio)
-    data_fim = parse_data(body.data_fim)
-
-    if data_fim < data_inicio:
-        raise HTTPException(
-            status_code=400,
-            detail="data_fim não pode ser menor que data_inicio."
-        )
+def sync_tiny_periodo(
+    body: PeriodoBody,
+    filial: str = Query("sp", description="sp ou mg")
+):
 
     return sincronizar_periodo(data_inicio, data_fim, tipo="periodo")
 
