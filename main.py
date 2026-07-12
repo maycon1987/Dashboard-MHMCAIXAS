@@ -1402,7 +1402,6 @@ def buscar_pedidos_banco_periodo_corrigido(
         ("order", "data_pedido.asc")
     ]
     params = adicionar_filtro_filial_params(params, filial)
-    params = adicionar_filtro_filial_params(params, filial)
 
     response = requests.get(
         url,
@@ -1431,6 +1430,8 @@ def buscar_itens_banco_periodo_corrigido(
 ) -> List[Dict[str, Any]]:
     validar_env()
 
+    filial_normalizada = normalizar_filial(filial)
+
     url = f"{SUPABASE_URL}/rest/v1/itens_pedido"
 
     params = [
@@ -1439,6 +1440,9 @@ def buscar_itens_banco_periodo_corrigido(
         ("data_pedido", f"lte.{data_fim.isoformat()}"),
         ("order", "data_pedido.asc")
     ]
+
+    if filial_normalizada != "all":
+        params.append(("filial", f"eq.{filial_normalizada}"))
 
     response = requests.get(
         url,
@@ -1453,7 +1457,8 @@ def buscar_itens_banco_periodo_corrigido(
             detail={
                 "erro": "Erro ao consultar itens por período.",
                 "status_code": response.status_code,
-                "resposta": response.text
+                "resposta": response.text,
+                "filial": filial_normalizada
             }
         )
 
