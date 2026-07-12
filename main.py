@@ -5,8 +5,9 @@ from datetime import date, datetime, timedelta
 from calendar import monthrange
 from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 
@@ -16,7 +17,7 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.0.1",
+    version="2.1.0",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
@@ -44,6 +45,13 @@ SUPABASE_SERVICE_ROLE_KEY = (
 )
 
 TINY_BASE_URL = "https://api.tiny.com.br/api2"
+
+# Ativação gradual da proteção JWT.
+# Primeiro publique com false, ajuste o Lovable para enviar o token,
+# teste e só depois altere para true no Railway.
+JWT_AUTH_ENABLED = os.getenv("JWT_AUTH_ENABLED", "false").strip().lower() in [
+    "1", "true", "yes", "sim", "on"
+]
 
 # ============================================================
 # HELPERS GERAIS
@@ -364,6 +372,189 @@ def adicionar_filtro_filial_params(params: List[Any], filial: str = "sp") -> Lis
     if filial_normalizada != "all":
         params.append(("filial", f"eq.{filial_normalizada}"))
     return params
+
+
+
+# ============================================================
+# AUTENTICAÇÃO E AUTORIZAÇÃO — SUPABASE JWT
+# ============================================================
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def validar_token_supabase(access_token: str) -> Dict[str, Any]:
+    """
+    Valida o access_token diretamente no Supabase Auth.
+
+    Essa abordagem funciona tanto para projetos com assinatura JWT legada
+    quanto para projetos com chaves assimétricas, sem expor o JWT Secret.
+    """
+    validar_env()
+
+    url = f"{SUPABASE_URL}/auth/v1/user"
+
+    response = requests.get(
+        url,
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        timeout=30
+    )
+
+    if response.status_code in [401, 403]:
+        raise HTTPException(
+            status_code=401,
+            detail="Sessão inválida ou expirada. Faça login novamente."
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "erro": "Não foi possível validar a sessão no Supabase Auth.",
+                "status_code": response.status_code,
+                "resposta": response.text
+            }
+        )
+
+    usuario_auth = response.json()
+
+    if not usuario_auth.get("id") or not usuario_auth.get("email"):
+        raise HTTPException(
+            status_code=401,
+            detail="Token válido, mas sem identificação de usuário."
+        )
+
+    return usuario_auth
+
+
+def buscar_perfil_dashboard(email: str) -> Dict[str, Any]:
+    """
+    Consulta a autorização interna do usuário na tabela usuarios_dashboard.
+    """
+    resultado = supabase_get(
+        "usuarios_dashboard",
+        {
+            "select": "email,nome,perfil,filial,ativo",
+            "email": f"eq.{email}",
+            "limit": "1"
+        }
+    )
+
+    if not resultado:
+        raise HTTPException(
+            status_code=403,
+            detail="Usuário autenticado, mas sem acesso ao Dashboard MHM."
+        )
+
+    perfil = resultado[0]
+
+    if perfil.get("ativo") is False:
+        raise HTTPException(
+            status_code=403,
+            detail="Usuário desativado no Dashboard MHM."
+        )
+
+    perfil["perfil"] = safe_str(perfil.get("perfil")).lower().strip()
+    perfil["filial"] = normalizar_filial(perfil.get("filial") or "sp")
+
+    return perfil
+
+
+def obter_usuario_atual(
+    credenciais: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)
+) -> Dict[str, Any]:
+    """
+    Dependência usada pelas rotas protegidas.
+
+    Durante a implantação, JWT_AUTH_ENABLED=false mantém compatibilidade
+    temporária. Quando true, o Bearer token passa a ser obrigatório.
+    """
+    if not JWT_AUTH_ENABLED:
+        return {
+            "id": "modo-implantacao",
+            "email": "sistema@interno",
+            "nome": "Modo de implantação",
+            "perfil": "admin",
+            "filial": "all",
+            "ativo": True,
+            "auth_desativada_temporariamente": True
+        }
+
+    if not credenciais or not credenciais.credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Token de acesso não informado.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    usuario_auth = validar_token_supabase(credenciais.credentials)
+    perfil = buscar_perfil_dashboard(usuario_auth["email"])
+
+    return {
+        "id": usuario_auth["id"],
+        "email": usuario_auth["email"],
+        "nome": perfil.get("nome") or usuario_auth.get("email"),
+        "perfil": perfil.get("perfil"),
+        "filial": perfil.get("filial"),
+        "ativo": perfil.get("ativo", True)
+    }
+
+
+def resolver_filial_autorizada(
+    filial_solicitada: Optional[str],
+    usuario: Dict[str, Any],
+    permitir_all: bool = True
+) -> str:
+    """
+    Decide a filial no backend.
+
+    - Usuário com filial=all pode escolher sp, mg ou all.
+    - Usuário restrito a sp/mg só pode consultar sua própria filial.
+    - Quando a filial não é enviada, usa a filial do próprio usuário.
+    """
+    filial_usuario = normalizar_filial(usuario.get("filial") or "sp")
+
+    if filial_solicitada is None or not safe_str(filial_solicitada).strip():
+        if filial_usuario == "all":
+            return "all" if permitir_all else "sp"
+        return filial_usuario
+
+    filial_pedida = normalizar_filial(filial_solicitada)
+
+    if not permitir_all and filial_pedida == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Esta operação não aceita filial=all."
+        )
+
+    if filial_usuario == "all":
+        return filial_pedida
+
+    if filial_pedida != filial_usuario:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Usuário sem permissão para acessar a filial '{filial_pedida}'."
+        )
+
+    return filial_usuario
+
+
+@app.get("/auth/me")
+def auth_me(
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    """
+    Retorna o usuário reconhecido pelo backend.
+    Útil para testar a integração JWT com o Lovable.
+    """
+    return {
+        "status": "ok",
+        "auth_ativa": JWT_AUTH_ENABLED,
+        "usuario": usuario
+    }
 
 
 # ============================================================
@@ -1084,7 +1275,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "version": "2.0.1"
+        "version": "2.1.0"
     }
 
 
@@ -1094,7 +1285,8 @@ def health():
         "status": "ok",
         "tiny_token_ok": bool(TINY_TOKEN),
         "supabase_url_ok": bool(SUPABASE_URL),
-        "supabase_key_ok": bool(SUPABASE_SERVICE_ROLE_KEY)
+        "supabase_key_ok": bool(SUPABASE_SERVICE_ROLE_KEY),
+        "jwt_auth_enabled": JWT_AUTH_ENABLED
     }
 
 
@@ -1120,6 +1312,9 @@ def rotas():
         ],
         "configuracoes": [
             "/configuracoes/data-inicio-tiny"
+        ],
+        "auth": [
+            "/auth/me"
         ]
     }
 
@@ -1496,8 +1691,10 @@ def calcular_resumo_periodo_banco(
 @app.get("/db/resumo-diario")
 def db_resumo_diario(
     data: Optional[str] = Query(None),
-    filial: str = Query("sp", description="sp, mg ou all")
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     params = {
         "select": "*",
         "order": "data.desc"
@@ -1520,8 +1717,10 @@ def db_resumo_diario(
 def db_resumo_mensal(
     ano: Optional[int] = Query(None),
     mes: Optional[int] = Query(None),
-    filial: str = Query("sp", description="sp, mg ou all")
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     params = {
         "select": "*",
         "order": "ano.desc,mes.desc"
@@ -1546,8 +1745,10 @@ def db_resumo_mensal(
 @app.get("/db/resumo-anual")
 def db_resumo_anual(
     ano: Optional[int] = Query(None),
-    filial: str = Query("sp", description="sp, mg ou all")
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     params = {
         "select": "*",
         "order": "ano.desc"
@@ -1568,8 +1769,10 @@ def db_resumo_anual(
 
 @app.get("/db/dashboard-resumo")
 def db_dashboard_resumo(
-    filial: str = Query("sp", description="sp, mg ou all")
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     hoje = hoje_br()
     inicio_30 = hoje - timedelta(days=30)
 
@@ -1601,13 +1804,17 @@ def db_dashboard_resumo(
         params_mes
     )
 
+    params_logs = {
+        "select": "*",
+        "order": "created_at.desc",
+        "limit": "10"
+    }
+    if filial_normalizada != "all":
+        params_logs["filial"] = f"eq.{filial_normalizada}"
+
     ultimos_logs = supabase_get(
         "sync_logs",
-        {
-            "select": "*",
-            "order": "created_at.desc",
-            "limit": "10"
-        }
+        params_logs
     )
 
     resumo_30 = calcular_resumo_periodo_banco(inicio_30, hoje, filial=filial)
@@ -1623,18 +1830,25 @@ def db_dashboard_resumo(
 
 @app.get("/db/sync-logs")
 def db_sync_logs(
-    limit: int = Query(20)
+    limit: int = Query(20),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
+    params = {
+        "select": "*",
+        "order": "created_at.desc",
+        "limit": str(limit)
+    }
+
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params["filial"] = f"eq.{filial_normalizada}"
+
     return {
         "status": "ok",
-        "dados": supabase_get(
-            "sync_logs",
-            {
-                "select": "*",
-                "order": "created_at.desc",
-                "limit": str(limit)
-            }
-        )
+        "filial": filial_normalizada,
+        "dados": supabase_get("sync_logs", params)
     }
 
 
@@ -1642,8 +1856,10 @@ def db_sync_logs(
 def db_resumo_periodo(
     data_inicio: str = Query(..., description="YYYY-MM-DD"),
     data_fim: str = Query(..., description="YYYY-MM-DD"),
-    filial: str = Query("sp", description="sp, mg ou all")
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     inicio = parse_data(data_inicio)
     fim = parse_data(data_fim)
 
@@ -1729,8 +1945,10 @@ def db_ranking_periodo(
     data_inicio: str = Query(..., description="YYYY-MM-DD"),
     data_fim: str = Query(..., description="YYYY-MM-DD"),
     limite: int = Query(10),
-    filial: str = Query("sp", description="sp, mg ou all")
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     inicio = parse_data(data_inicio)
     fim = parse_data(data_fim)
 
@@ -1763,8 +1981,10 @@ def db_ranking_periodo(
 def db_faturamento_canais(
     data_inicio: str = Query(..., description="YYYY-MM-DD"),
     data_fim: str = Query(..., description="YYYY-MM-DD"),
-    filial: str = Query("sp", description="sp, mg ou all")
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     inicio = parse_data(data_inicio)
     fim = parse_data(data_fim)
 
