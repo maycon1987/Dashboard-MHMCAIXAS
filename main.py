@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.1.2",
+    version="2.1.3",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
@@ -618,6 +618,36 @@ def tiny_get(endpoint: str, params: Dict[str, Any], filial: str = "sp") -> Dict[
 
     status = retorno.get("status")
     if status and str(status).upper() == "ERRO":
+        codigo_erro = safe_str(retorno.get("codigo_erro")).strip()
+        erros = retorno.get("erros") or []
+
+        mensagens_erro = []
+        for item in erros:
+            if isinstance(item, dict):
+                mensagens_erro.append(
+                    safe_str(item.get("erro") or item.get("mensagem") or "")
+                )
+            else:
+                mensagens_erro.append(safe_str(item))
+
+        texto_erros = " ".join(mensagens_erro).lower()
+
+        # O Tiny usa código 20 quando a pesquisa não encontra registros.
+        # Isso não é falha da sincronização: significa apenas dia/período sem vendas.
+        if codigo_erro == "20" or "não retornou registros" in texto_erros or "nao retornou registros" in texto_erros:
+            retorno_vazio = {
+                "status": "OK",
+                "status_processamento": retorno.get("status_processamento", "3"),
+                "numero_paginas": 1
+            }
+
+            if "pedidos.pesquisa.php" in endpoint:
+                retorno_vazio["pedidos"] = []
+            elif "produtos.pesquisa.php" in endpoint:
+                retorno_vazio["produtos"] = []
+
+            return {"retorno": retorno_vazio}
+
         raise HTTPException(
             status_code=500,
             detail={
@@ -1275,7 +1305,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "version": "2.1.2"
+        "version": "2.1.3"
     }
 
 
