@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.1.0",
+    version="2.1.2",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
@@ -1275,7 +1275,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "version": "2.1.0"
+        "version": "2.1.2"
     }
 
 
@@ -1790,19 +1790,74 @@ def db_dashboard_resumo(
         params_hoje
     )
 
-    params_mes = {
-        "ano": f"eq.{hoje.year}",
-        "mes": f"eq.{hoje.month}",
-        "select": "*",
-        "limit": "1"
-    }
-    if filial_normalizada != "all":
-        params_mes["filial"] = f"eq.{filial_normalizada}"
+    # Calcula o mês atual diretamente pela soma do resumo_diario.
+    # A tabela resumo_mensal só é atualizada quando /sync/tiny-mes é executado,
+    # então ela pode ficar vazia ou desatualizada durante o mês.
+    inicio_mes = date(hoje.year, hoje.month, 1)
 
-    resumo_mes = supabase_get(
-        "resumo_mensal",
-        params_mes
+    validar_env()
+    url_mes = f"{SUPABASE_URL}/rest/v1/resumo_diario"
+    params_mes = [
+        ("select", "data_resumo,faturamento_total,total_pedidos,total_unidades_vendidas,total_produtos_diferentes"),
+        ("data_resumo", f"gte.{inicio_mes.isoformat()}"),
+        ("data_resumo", f"lte.{hoje.isoformat()}"),
+        ("order", "data_resumo.asc"),
+        ("limit", "1000"),
+    ]
+    params_mes = adicionar_filtro_filial_params(params_mes, filial)
+
+    resp_mes = requests.get(
+        url_mes,
+        headers=supabase_headers(),
+        params=params_mes,
+        timeout=60
     )
+
+    if resp_mes.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Erro ao calcular o resumo do mês atual.",
+                "status_code": resp_mes.status_code,
+                "resposta": resp_mes.text,
+                "filial": filial_normalizada
+            }
+        )
+
+    registros_mes = resp_mes.json()
+
+    faturamento_mes = round(
+        sum(float(r.get("faturamento_total") or 0) for r in registros_mes),
+        2
+    )
+    total_pedidos_mes = sum(
+        int(r.get("total_pedidos") or 0) for r in registros_mes
+    )
+    total_unidades_mes = round(
+        sum(float(r.get("total_unidades_vendidas") or 0) for r in registros_mes),
+        2
+    )
+    total_produtos_diferentes_mes = sum(
+        int(r.get("total_produtos_diferentes") or 0) for r in registros_mes
+    )
+    ticket_medio_mes = round(
+        faturamento_mes / total_pedidos_mes,
+        2
+    ) if total_pedidos_mes else 0.0
+
+    resumo_mes = {
+        "ano": hoje.year,
+        "mes": hoje.month,
+        "data_inicio": inicio_mes.isoformat(),
+        "data_fim": hoje.isoformat(),
+        "faturamento": faturamento_mes,
+        "faturamento_total": faturamento_mes,
+        "total_pedidos": total_pedidos_mes,
+        "ticket_medio": ticket_medio_mes,
+        "total_unidades_vendidas": total_unidades_mes,
+        "total_produtos_diferentes": total_produtos_diferentes_mes,
+        "filial": filial_normalizada
+    }
 
     params_logs = {
         "select": "*",
@@ -1822,7 +1877,7 @@ def db_dashboard_resumo(
     return {
         "status": "ok",
         "hoje": resumo_hoje[0] if resumo_hoje else None,
-        "mes_atual": resumo_mes[0] if resumo_mes else None,
+        "mes_atual": resumo_mes,
         "ultimos_30_dias": resumo_30,
         "sync_logs": ultimos_logs
     }
