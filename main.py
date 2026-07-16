@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.1.3",
+    version="2.1.4",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
@@ -1305,7 +1305,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "version": "2.1.3"
+        "version": "2.1.4"
     }
 
 
@@ -1904,9 +1904,21 @@ def db_dashboard_resumo(
 
     resumo_30 = calcular_resumo_periodo_banco(inicio_30, hoje, filial=filial)
 
+    resumo_hoje_padrao = {
+        "data": hoje.isoformat(),
+        "data_resumo": hoje.isoformat(),
+        "faturamento_total": 0.0,
+        "total_pedidos": 0,
+        "ticket_medio": 0.0,
+        "total_unidades_vendidas": 0.0,
+        "total_produtos_diferentes": 0,
+        "origem": "Tiny/Olist",
+        "filial": filial_normalizada
+    }
+
     return {
         "status": "ok",
-        "hoje": resumo_hoje[0] if resumo_hoje else None,
+        "hoje": resumo_hoje[0] if resumo_hoje else resumo_hoje_padrao,
         "mes_atual": resumo_mes,
         "ultimos_30_dias": resumo_30,
         "sync_logs": ultimos_logs
