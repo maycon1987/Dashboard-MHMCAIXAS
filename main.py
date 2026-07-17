@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.1.4",
+    version="2.2.0",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
@@ -798,6 +798,44 @@ def definir_canal_venda(pedido: Dict[str, Any]) -> str:
     return "COMERCIAL"
 
 
+def normalizar_texto_tag(valor: str) -> str:
+    texto = safe_str(valor).strip().upper()
+    substituicoes = {
+        "Á": "A", "À": "A", "Ã": "A", "Â": "A",
+        "É": "E", "Ê": "E", "Í": "I",
+        "Ó": "O", "Ô": "O", "Õ": "O",
+        "Ú": "U", "Ç": "C",
+    }
+    for origem, destino in substituicoes.items():
+        texto = texto.replace(origem, destino)
+    return " ".join(texto.split())
+
+
+TAGS_ORIGEM_CLIENTE = {
+    "INSTAGRAM": "Instagram",
+    "INSTA": "Instagram",
+    "TIKTOK": "TikTok",
+    "TIK TOK": "TikTok",
+    "GOOGLE": "Google",
+    "RUA": "Passando na Rua",
+    "PASSANDO NA RUA": "Passando na Rua",
+    "PASSOU NA RUA": "Passando na Rua",
+    "PROSPECCAO": "Prospecção",
+    "PROSPECTADO": "Prospecção",
+    "INDICACAO": "Indicação",
+    "INDICADO": "Indicação",
+}
+
+
+def definir_origem_cliente(pedido: Dict[str, Any]) -> str:
+    marcadores = extrair_marcadores_pedido(pedido)
+    for marcador in marcadores:
+        marcador_normalizado = normalizar_texto_tag(marcador)
+        if marcador_normalizado in TAGS_ORIGEM_CLIENTE:
+            return TAGS_ORIGEM_CLIENTE[marcador_normalizado]
+    return "Sem origem"
+
+
 def extrair_nome_cliente(pedido: Dict[str, Any]) -> str:
     cliente = pedido.get("cliente")
 
@@ -833,6 +871,7 @@ def normalizar_pedido_resumo(
 
     marcadores = extrair_marcadores_pedido(pedido)
     canal_venda = definir_canal_venda(pedido)
+    origem_cliente = definir_origem_cliente(pedido)
 
     return {
     "tiny_id": id_pedido,
@@ -845,6 +884,7 @@ def normalizar_pedido_resumo(
 
     "marcadores": marcadores,
     "canal_venda": canal_venda,
+    "origem_cliente": origem_cliente,
 
     "filial": filial,
 
@@ -1305,7 +1345,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "version": "2.1.4"
+        "version": "2.2.0"
     }
 
 
@@ -1338,6 +1378,7 @@ def rotas():
             "/db/resumo-periodo",
             "/db/ranking-periodo",
             "/db/faturamento-canais",
+            "/db/faturamento-origens",
             "/db/sync-logs"
         ],
         "configuracoes": [
@@ -1904,21 +1945,9 @@ def db_dashboard_resumo(
 
     resumo_30 = calcular_resumo_periodo_banco(inicio_30, hoje, filial=filial)
 
-    resumo_hoje_padrao = {
-        "data": hoje.isoformat(),
-        "data_resumo": hoje.isoformat(),
-        "faturamento_total": 0.0,
-        "total_pedidos": 0,
-        "ticket_medio": 0.0,
-        "total_unidades_vendidas": 0.0,
-        "total_produtos_diferentes": 0,
-        "origem": "Tiny/Olist",
-        "filial": filial_normalizada
-    }
-
     return {
         "status": "ok",
-        "hoje": resumo_hoje[0] if resumo_hoje else resumo_hoje_padrao,
+        "hoje": resumo_hoje[0] if resumo_hoje else None,
         "mes_atual": resumo_mes,
         "ultimos_30_dias": resumo_30,
         "sync_logs": ultimos_logs
@@ -2138,6 +2167,102 @@ def db_faturamento_canais(
         "pdv": resultado["PDV"],
         "comercial": resultado["COMERCIAL"],
         "total": total
+    }
+
+
+
+@app.get("/db/faturamento-origens")
+def db_faturamento_origens(
+    data_inicio: str = Query(..., description="YYYY-MM-DD"),
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    filial = resolver_filial_autorizada(filial, usuario)
+    inicio = parse_data(data_inicio)
+    fim = parse_data(data_fim)
+
+    if fim < inicio:
+        raise HTTPException(status_code=400, detail="data_fim não pode ser menor que data_inicio.")
+
+    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim, filial=filial)
+    agrupado: Dict[str, Dict[str, Any]] = {}
+
+    for pedido in pedidos:
+        origem = safe_str(pedido.get("origem_cliente") or "Sem origem").strip() or "Sem origem"
+        canal = safe_str(pedido.get("canal_venda") or "COMERCIAL").upper().strip()
+        if canal not in ["PDV", "COMERCIAL"]:
+            canal = "COMERCIAL"
+
+        valor = float(pedido.get("valor_total") or 0)
+
+        if origem not in agrupado:
+            agrupado[origem] = {
+                "origem": origem,
+                "pedidos": 0,
+                "faturamento": 0.0,
+                "ticket_medio": 0.0,
+                "percentual_pedidos": 0.0,
+                "percentual_faturamento": 0.0,
+                "pdv": {"pedidos": 0, "faturamento": 0.0, "ticket_medio": 0.0},
+                "comercial": {"pedidos": 0, "faturamento": 0.0, "ticket_medio": 0.0}
+            }
+
+        item = agrupado[origem]
+        item["pedidos"] += 1
+        item["faturamento"] += valor
+
+        chave_canal = "pdv" if canal == "PDV" else "comercial"
+        item[chave_canal]["pedidos"] += 1
+        item[chave_canal]["faturamento"] += valor
+
+    total_pedidos = sum(item["pedidos"] for item in agrupado.values())
+    total_faturamento = round(sum(item["faturamento"] for item in agrupado.values()), 2)
+
+    origens = []
+    for item in agrupado.values():
+        pedidos_origem = item["pedidos"]
+        faturamento_origem = item["faturamento"]
+
+        item["faturamento"] = round(faturamento_origem, 2)
+        item["ticket_medio"] = round(faturamento_origem / pedidos_origem, 2) if pedidos_origem else 0.0
+        item["percentual_pedidos"] = round(pedidos_origem / total_pedidos * 100, 2) if total_pedidos else 0.0
+        item["percentual_faturamento"] = round(faturamento_origem / total_faturamento * 100, 2) if total_faturamento else 0.0
+
+        for chave in ["pdv", "comercial"]:
+            qtd = item[chave]["pedidos"]
+            fat = item[chave]["faturamento"]
+            item[chave]["faturamento"] = round(fat, 2)
+            item[chave]["ticket_medio"] = round(fat / qtd, 2) if qtd else 0.0
+
+        origens.append(item)
+
+    origens.sort(key=lambda item: item["faturamento"], reverse=True)
+
+    sem_origem = next(
+        (item for item in origens if item["origem"] == "Sem origem"),
+        {"pedidos": 0, "faturamento": 0.0}
+    )
+
+    maior_ticket = max(origens, key=lambda item: item["ticket_medio"])["origem"] if origens else None
+
+    return {
+        "status": "ok",
+        "data_inicio": inicio.isoformat(),
+        "data_fim": fim.isoformat(),
+        "filial": normalizar_filial(filial),
+        "total": {
+            "pedidos": total_pedidos,
+            "faturamento": total_faturamento,
+            "ticket_medio": round(total_faturamento / total_pedidos, 2) if total_pedidos else 0.0
+        },
+        "destaques": {
+            "principal_origem": origens[0]["origem"] if origens else None,
+            "maior_ticket_medio": maior_ticket,
+            "pedidos_sem_origem": sem_origem["pedidos"],
+            "faturamento_sem_origem": sem_origem["faturamento"]
+        },
+        "origens": origens
     }
 
 
