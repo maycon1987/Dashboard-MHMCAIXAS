@@ -1,32 +1,41 @@
-from datetime import datetime
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 
-from .schemas import AtualizarProdutoTributarioBody
-from .service import (
-    listar_lotes,
-    listar_produtos,
-    normalizar_filial,
-    obter_resumo,
-    sincronizar_produtos,
-    supabase_patch,
+from . import service
+from .schemas import (
+    ProdutoTributarioAtualizacao,
+    RegraTributariaAtualizacao,
+    RegraTributariaCriacao,
 )
-
 
 router = APIRouter(prefix="/tributario", tags=["Tributário"])
 
 
+def model_to_dict(model: Any, exclude_none: bool = True) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_none=exclude_none, mode="json")
+    return model.dict(exclude_none=exclude_none)
+
+
+# ============================================================
+# PRODUTOS TRIBUTÁRIOS / TINY
+# ============================================================
+
 @router.post("/sync-produtos")
-def sync_produtos_tributarios(
-    filial: str = Query("sp", description="sp ou mg"),
+def sync_produtos(
+    filial: Optional[str] = Query(None, description="sp ou mg"),
     tamanho_lote: int = Query(50, ge=1, le=500),
-    detalhar: bool = Query(True, description="Consulta produto.obter.php para enriquecer os dados."),
-    limite_detalhes: int = Query(50, ge=0, le=500),
+    detalhar: bool = Query(True),
+    limite_detalhes: int = Query(50, ge=0),
     max_paginas: Optional[int] = Query(None, ge=1),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
 ):
-    return sincronizar_produtos(
-        filial=filial,
+    filial_resolvida = service.resolver_filial_autorizada(
+        filial, usuario, permitir_all=False
+    )
+    return service.sincronizar_produtos(
+        filial=filial_resolvida,
         tamanho_lote=tamanho_lote,
         detalhar=detalhar,
         limite_detalhes=limite_detalhes,
@@ -35,24 +44,28 @@ def sync_produtos_tributarios(
 
 
 @router.get("/resumo")
-def resumo_tributario(
-    filial: str = Query("sp", description="sp, mg ou all"),
+def resumo(
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
 ):
-    return obter_resumo(filial)
+    filial_resolvida = service.resolver_filial_autorizada(filial, usuario)
+    return service.obter_resumo(filial_resolvida)
 
 
 @router.get("/produtos")
-def produtos_tributarios(
-    filial: str = Query("sp", description="sp, mg ou all"),
+def produtos(
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
     status_tributario: Optional[str] = Query(None),
     status_ia: Optional[str] = Query(None),
     lote: Optional[int] = Query(None, ge=1),
     busca: Optional[str] = Query(None),
-    limite: int = Query(100, ge=1, le=1000),
+    limite: int = Query(100, ge=1, le=10000),
     offset: int = Query(0, ge=0),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
 ):
-    dados = listar_produtos(
-        filial=filial,
+    filial_resolvida = service.resolver_filial_autorizada(filial, usuario)
+    return service.listar_produtos(
+        filial=filial_resolvida,
         status_tributario=status_tributario,
         status_ia=status_ia,
         lote=lote,
@@ -60,57 +73,129 @@ def produtos_tributarios(
         limite=limite,
         offset=offset,
     )
-    return {
-        "status": "ok",
-        "filial": normalizar_filial(filial),
-        "total_retornado": len(dados),
-        "limite": limite,
-        "offset": offset,
-        "dados": dados,
-    }
 
 
 @router.get("/lotes")
-def lotes_tributarios(
-    filial: str = Query("sp", description="sp, mg ou all"),
+def lotes(
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
 ):
-    dados = listar_lotes(filial)
-    return {
-        "status": "ok",
-        "filial": normalizar_filial(filial),
-        "total_lotes": len(dados),
-        "dados": dados,
-    }
+    filial_resolvida = service.resolver_filial_autorizada(filial, usuario)
+    return service.listar_lotes(filial_resolvida)
 
 
-@router.get("/lote/{numero}")
-def produtos_do_lote(
-    numero: int,
-    filial: str = Query("sp", description="sp ou mg"),
-    limite: int = Query(500, ge=1, le=1000),
+@router.get("/lote/{numero_lote}")
+def lote(
+    numero_lote: int,
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
 ):
-    if numero < 1:
-        raise HTTPException(status_code=400, detail="Número do lote inválido.")
-    dados = listar_produtos(filial, None, None, numero, None, limite, 0)
-    return {
-        "status": "ok",
-        "filial": normalizar_filial(filial),
-        "lote": numero,
-        "total_produtos": len(dados),
-        "dados": dados,
-    }
+    filial_resolvida = service.resolver_filial_autorizada(filial, usuario)
+    return service.obter_lote(filial_resolvida, numero_lote)
 
 
 @router.patch("/produto/{produto_id}")
-def atualizar_produto_tributario(
+def atualizar_produto(
     produto_id: str,
-    body: AtualizarProdutoTributarioBody,
+    body: ProdutoTributarioAtualizacao,
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
 ):
-    dados: Dict[str, Any] = body.model_dump(exclude_none=True)
-    if not dados:
-        raise HTTPException(status_code=400, detail="Nenhum campo foi informado.")
-    dados["updated_at"] = datetime.now().isoformat()
-    atualizado = supabase_patch(produto_id, dados)
-    if not atualizado:
-        raise HTTPException(status_code=404, detail="Produto tributário não encontrado.")
-    return {"status": "ok", "produto": atualizado[0]}
+    _ = usuario
+    return service.atualizar_produto(produto_id, model_to_dict(body))
+
+
+# ============================================================
+# REGRAS TRIBUTÁRIAS POR NCM
+# ============================================================
+
+@router.get("/regras")
+def regras(
+    ncm: Optional[str] = Query(None),
+    regime_tributario: Optional[str] = Query(None),
+    uf_origem: Optional[str] = Query(None),
+    uf_destino: Optional[str] = Query(None),
+    tipo_operacao: Optional[str] = Query(None),
+    finalidade: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    ativo: Optional[bool] = Query(True),
+    limite: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    _ = usuario
+    return service.listar_regras(
+        ncm=ncm,
+        regime_tributario=regime_tributario,
+        uf_origem=uf_origem,
+        uf_destino=uf_destino,
+        tipo_operacao=tipo_operacao,
+        finalidade=finalidade,
+        status=status,
+        ativo=ativo,
+        limite=limite,
+        offset=offset,
+    )
+
+
+@router.get("/regra-aplicavel")
+def regra_aplicavel(
+    ncm: str = Query(..., min_length=8, max_length=8),
+    regime_tributario: str = Query("lucro_presumido"),
+    uf_origem: str = Query("SP", min_length=2, max_length=2),
+    uf_destino: str = Query("SP", min_length=2, max_length=2),
+    tipo_operacao: str = Query("venda"),
+    finalidade: str = Query("revenda"),
+    consumidor_final: bool = Query(False),
+    contribuinte_icms: bool = Query(True),
+    data_referencia: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    _ = usuario
+    return service.buscar_regra_aplicavel(
+        ncm=ncm,
+        regime_tributario=regime_tributario,
+        uf_origem=uf_origem,
+        uf_destino=uf_destino,
+        tipo_operacao=tipo_operacao,
+        finalidade=finalidade,
+        consumidor_final=consumidor_final,
+        contribuinte_icms=contribuinte_icms,
+        data_referencia=data_referencia,
+    )
+
+
+@router.get("/regra/{regra_id}")
+def regra(
+    regra_id: str,
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    _ = usuario
+    return service.obter_regra(regra_id)
+
+
+@router.post("/regra", status_code=201)
+def criar_regra(
+    body: RegraTributariaCriacao,
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    _ = usuario
+    return service.criar_regra(model_to_dict(body, exclude_none=False))
+
+
+@router.patch("/regra/{regra_id}")
+def atualizar_regra(
+    regra_id: str,
+    body: RegraTributariaAtualizacao,
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    _ = usuario
+    return service.atualizar_regra(regra_id, model_to_dict(body))
+
+
+@router.delete("/regra/{regra_id}")
+def excluir_regra(
+    regra_id: str,
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    _ = usuario
+    return service.excluir_regra(regra_id)
