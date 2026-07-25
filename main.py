@@ -1,11 +1,17 @@
 import os
 import time
+import io
+import re
+import json
+import html
+import zipfile
 import requests
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from calendar import monthrange
 from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, Query, HTTPException, Depends
+from fastapi import FastAPI, Query, HTTPException, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -19,7 +25,7 @@ from app.modules.tributario.router import router as tributario_router
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.2.0",
+    version="2.3.0",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
@@ -662,6 +668,351 @@ def tiny_get(endpoint: str, params: Dict[str, Any], filial: str = "sp") -> Dict[
 
     return dados
 
+
+
+# ============================================================
+# TINY FISCAL — NOTAS E XML
+# ============================================================
+
+def tiny_post_xml(
+    endpoint: str,
+    params: Dict[str, Any],
+    filial: str = "sp",
+    tentativas: int = 4
+) -> str:
+    """
+    Executa um POST na API 2.0 do Tiny para endpoints que retornam XML.
+
+    O endpoint nota.fiscal.obter.xml.php não retorna JSON: ele devolve um
+    XML de resposta contendo xml_nfe e, quando existir, xml_cancelamento.
+    """
+    url = f"{TINY_BASE_URL}/{endpoint}"
+    payload = {
+        "token": obter_token_tiny(filial),
+        **params,
+    }
+
+    ultimo_erro = None
+
+    for tentativa in range(1, max(1, tentativas) + 1):
+        try:
+            response = requests.post(url, data=payload, timeout=120)
+        except requests.RequestException as exc:
+            ultimo_erro = str(exc)
+            if tentativa < tentativas:
+                time.sleep(min(2 ** tentativa, 10))
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "erro": "Falha de comunicação com o Tiny.",
+                    "endpoint": endpoint,
+                    "detalhe": ultimo_erro,
+                }
+            )
+
+        if response.status_code >= 400:
+            ultimo_erro = response.text
+            if tentativa < tentativas and response.status_code in [429, 500, 502, 503, 504]:
+                time.sleep(min(2 ** tentativa, 10))
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "erro": "Erro HTTP ao consultar o XML no Tiny.",
+                    "endpoint": endpoint,
+                    "status_code": response.status_code,
+                    "resposta": response.text[:2000],
+                }
+            )
+
+        conteudo = response.text or ""
+
+        # Códigos 6 e 11 indicam bloqueio temporário por excesso/concor­rência.
+        bloqueio_temporario = (
+            "<codigo_erro>6</codigo_erro>" in conteudo
+            or "<codigo_erro>11</codigo_erro>" in conteudo
+        )
+        if bloqueio_temporario and tentativa < tentativas:
+            time.sleep(min(2 ** tentativa, 12))
+            continue
+
+        return conteudo
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "erro": "Não foi possível consultar o Tiny após novas tentativas.",
+            "endpoint": endpoint,
+            "detalhe": ultimo_erro,
+        }
+    )
+
+
+def pesquisar_notas_fiscais_tiny(
+    data_inicial: date,
+    data_final: date,
+    pagina: int = 1,
+    filial: str = "sp"
+) -> Dict[str, Any]:
+    return tiny_get(
+        "notas.fiscais.pesquisa.php",
+        {
+            "tipoNota": "S",
+            "dataInicial": data_inicial.strftime("%d/%m/%Y"),
+            "dataFinal": data_final.strftime("%d/%m/%Y"),
+            "pagina": pagina,
+        },
+        filial=filial,
+    )
+
+
+def extrair_lista_notas_fiscais(resposta_tiny: Dict[str, Any]) -> List[Dict[str, Any]]:
+    retorno = resposta_tiny.get("retorno", {}) or {}
+    notas_raw = retorno.get("notas_fiscais", []) or []
+    notas: List[Dict[str, Any]] = []
+
+    for item in notas_raw:
+        if isinstance(item, dict):
+            nota = item.get("nota_fiscal", item)
+            if isinstance(nota, dict):
+                notas.append(nota)
+
+    return notas
+
+
+def buscar_notas_fiscais_periodo_tiny(
+    data_inicial: date,
+    data_final: date,
+    filial: str = "sp",
+    limite: int = 0,
+    pausa_segundos: float = 0.35
+) -> List[Dict[str, Any]]:
+    """
+    Pesquisa notas de saída, com paginação de até 100 registros por página.
+
+    limite=0 significa sem limite artificial. O limite é aplicado depois da
+    paginação e existe apenas para permitir downloads menores no frontend.
+    """
+    todas: List[Dict[str, Any]] = []
+    pagina = 1
+
+    while True:
+        resposta = pesquisar_notas_fiscais_tiny(
+            data_inicial,
+            data_final,
+            pagina=pagina,
+            filial=filial,
+        )
+        retorno = resposta.get("retorno", {}) or {}
+        notas = extrair_lista_notas_fiscais(resposta)
+        todas.extend(notas)
+
+        if limite > 0 and len(todas) >= limite:
+            return todas[:limite]
+
+        numero_paginas = int(retorno.get("numero_paginas", 1) or 1)
+        if pagina >= numero_paginas:
+            break
+
+        pagina += 1
+        time.sleep(pausa_segundos)
+
+    return todas
+
+
+def modelo_nota_pela_chave(chave_acesso: Any) -> str:
+    """
+    Na chave de acesso da NF-e/NFC-e, o modelo ocupa as posições 21 e 22.
+    Modelo 55 = NF-e; modelo 65 = NFC-e.
+    """
+    chave = re.sub(r"\D", "", safe_str(chave_acesso))
+    if len(chave) == 44:
+        modelo = chave[20:22]
+        if modelo == "55":
+            return "nfe"
+        if modelo == "65":
+            return "nfce"
+    return "outros"
+
+
+def nota_fiscal_valida_para_total(nota: Dict[str, Any]) -> bool:
+    descricao = normalizar_texto_tag(
+        safe_str(nota.get("descricao_situacao") or nota.get("situacao") or "")
+    )
+    termos_invalidos = [
+        "CANCEL", "REJEIT", "DENEG", "INUTIL", "NAO AUTORIZ",
+    ]
+    return not any(termo in descricao for termo in termos_invalidos)
+
+
+def resumir_notas_fiscais(notas: List[Dict[str, Any]]) -> Dict[str, Any]:
+    grupos = {
+        "nfe": {"quantidade": 0, "valor_total": 0.0},
+        "nfce": {"quantidade": 0, "valor_total": 0.0},
+        "outros": {"quantidade": 0, "valor_total": 0.0},
+    }
+    situacoes: Dict[str, Dict[str, Any]] = {}
+    documentos_invalidos = 0
+    valor_invalidos = 0.0
+
+    for nota in notas:
+        modelo = modelo_nota_pela_chave(nota.get("chave_acesso"))
+        valor = dinheiro_para_float(nota.get("valor"))
+        situacao = safe_str(
+            nota.get("descricao_situacao") or nota.get("situacao") or "Sem situação"
+        ).strip() or "Sem situação"
+
+        if situacao not in situacoes:
+            situacoes[situacao] = {"quantidade": 0, "valor_total": 0.0}
+        situacoes[situacao]["quantidade"] += 1
+        situacoes[situacao]["valor_total"] += valor
+
+        if nota_fiscal_valida_para_total(nota):
+            grupos[modelo]["quantidade"] += 1
+            grupos[modelo]["valor_total"] += valor
+        else:
+            documentos_invalidos += 1
+            valor_invalidos += valor
+
+    for grupo in grupos.values():
+        grupo["valor_total"] = round(grupo["valor_total"], 2)
+
+    situacoes_lista = []
+    for nome, dados in situacoes.items():
+        situacoes_lista.append({
+            "situacao": nome,
+            "quantidade": dados["quantidade"],
+            "valor_total": round(dados["valor_total"], 2),
+        })
+    situacoes_lista.sort(key=lambda item: item["valor_total"], reverse=True)
+
+    quantidade_total = sum(grupo["quantidade"] for grupo in grupos.values())
+    valor_total = round(sum(grupo["valor_total"] for grupo in grupos.values()), 2)
+
+    return {
+        **grupos,
+        "total_geral": {
+            "quantidade": quantidade_total,
+            "valor_total": valor_total,
+        },
+        "documentos_desconsiderados": {
+            "quantidade": documentos_invalidos,
+            "valor_total": round(valor_invalidos, 2),
+            "motivo": "Canceladas, rejeitadas, denegadas, inutilizadas ou não autorizadas.",
+        },
+        "situacoes": situacoes_lista,
+    }
+
+
+def _tag_local(elemento: ET.Element) -> str:
+    return elemento.tag.split("}")[-1] if "}" in elemento.tag else elemento.tag
+
+
+def extrair_xml_nfe_resposta_tiny(conteudo_resposta: str) -> Dict[str, Optional[str]]:
+    """
+    Extrai o XML fiscal e o XML de cancelamento do envelope retornado pelo Tiny.
+    Funciona tanto quando o XML vem como filho real quanto quando vem escapado.
+    """
+    if not conteudo_resposta.strip():
+        raise HTTPException(status_code=502, detail="Tiny retornou resposta vazia ao obter XML.")
+
+    try:
+        raiz = ET.fromstring(conteudo_resposta)
+    except ET.ParseError:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "erro": "Tiny retornou XML de resposta inválido.",
+                "resposta": conteudo_resposta[:2000],
+            }
+        )
+
+    status = ""
+    codigo_erro = ""
+    mensagens: List[str] = []
+    elemento_xml_nfe = None
+    elemento_xml_cancelamento = None
+
+    for elemento in raiz.iter():
+        nome = _tag_local(elemento)
+        if nome == "status":
+            status = safe_str(elemento.text).strip()
+        elif nome == "codigo_erro":
+            codigo_erro = safe_str(elemento.text).strip()
+        elif nome == "erro":
+            mensagem = safe_str(elemento.text).strip()
+            if mensagem:
+                mensagens.append(mensagem)
+        elif nome == "xml_nfe":
+            elemento_xml_nfe = elemento
+        elif nome == "xml_cancelamento":
+            elemento_xml_cancelamento = elemento
+
+    if status.upper() == "ERRO":
+        status_http = 404 if codigo_erro == "32" else 502
+        raise HTTPException(
+            status_code=status_http,
+            detail={
+                "erro": "Tiny não disponibilizou o XML solicitado.",
+                "codigo_erro": codigo_erro,
+                "mensagens": mensagens,
+            }
+        )
+
+    def conteudo_elemento(elemento: Optional[ET.Element]) -> Optional[str]:
+        if elemento is None:
+            return None
+
+        filhos = list(elemento)
+        if filhos:
+            partes = [
+                ET.tostring(filho, encoding="unicode")
+                for filho in filhos
+            ]
+            return "".join(partes).strip() or None
+
+        texto = html.unescape(safe_str(elemento.text)).strip()
+        return texto or None
+
+    xml_nfe = conteudo_elemento(elemento_xml_nfe)
+    xml_cancelamento = conteudo_elemento(elemento_xml_cancelamento)
+
+    if not xml_nfe:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "erro": "XML da nota não encontrado no retorno do Tiny.",
+                "codigo_erro": codigo_erro,
+                "mensagens": mensagens,
+            }
+        )
+
+    if not xml_nfe.lstrip().startswith("<?xml"):
+        xml_nfe = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_nfe
+
+    if xml_cancelamento and not xml_cancelamento.lstrip().startswith("<?xml"):
+        xml_cancelamento = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_cancelamento
+
+    return {
+        "xml_nfe": xml_nfe,
+        "xml_cancelamento": xml_cancelamento,
+    }
+
+
+def obter_xml_nota_fiscal_tiny(id_nota: str, filial: str = "sp") -> Dict[str, Optional[str]]:
+    resposta = tiny_post_xml(
+        "nota.fiscal.obter.xml.php",
+        {"id": id_nota},
+        filial=filial,
+    )
+    return extrair_xml_nfe_resposta_tiny(resposta)
+
+
+def nome_seguro_arquivo(valor: Any, padrao: str = "documento") -> str:
+    texto = re.sub(r"[^A-Za-z0-9._-]+", "_", safe_str(valor).strip())
+    texto = texto.strip("._-")
+    return texto or padrao
 
 def pesquisar_pedidos_tiny(
     data_inicial: date,
@@ -1349,7 +1700,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "version": "2.2.0"
+        "version": "2.3.0"
     }
 
 
@@ -1390,6 +1741,11 @@ def rotas():
         ],
         "auth": [
             "/auth/me"
+        ],
+        "fiscal": [
+            "/fiscal/xml/resumo",
+            "/fiscal/xml/nota",
+            "/fiscal/xml/download"
         ]
     }
 
@@ -2268,6 +2624,209 @@ def db_faturamento_origens(
         },
         "origens": origens
     }
+
+
+
+# ============================================================
+# ROTAS FISCAIS — NF-e, NFC-e E XML
+# ============================================================
+
+@app.get("/fiscal/xml/resumo")
+def fiscal_xml_resumo(
+    data_inicio: str = Query(..., description="YYYY-MM-DD"),
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    incluir_notas: bool = Query(False, description="Inclui a lista de notas no retorno."),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual),
+):
+    filial_resolvida = resolver_filial_autorizada(filial, usuario, permitir_all=False)
+    inicio = parse_data(data_inicio)
+    fim = parse_data(data_fim)
+
+    if fim < inicio:
+        raise HTTPException(status_code=400, detail="data_fim não pode ser menor que data_inicio.")
+
+    if (fim - inicio).days > 366:
+        raise HTTPException(status_code=400, detail="O período fiscal máximo é de 367 dias.")
+
+    notas = buscar_notas_fiscais_periodo_tiny(
+        inicio,
+        fim,
+        filial=filial_resolvida,
+    )
+    resumo = resumir_notas_fiscais(notas)
+
+    resposta: Dict[str, Any] = {
+        "status": "ok",
+        "filial": filial_resolvida,
+        "data_inicio": inicio.isoformat(),
+        "data_fim": fim.isoformat(),
+        **resumo,
+    }
+
+    if incluir_notas:
+        resposta["notas"] = notas
+
+    return resposta
+
+
+@app.get("/fiscal/xml/nota")
+def fiscal_xml_nota(
+    id_nota: str = Query(..., min_length=1, description="ID interno da nota fiscal no Tiny/Olist."),
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    incluir_cancelamento: bool = Query(False),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual),
+):
+    filial_resolvida = resolver_filial_autorizada(filial, usuario, permitir_all=False)
+    resultado = obter_xml_nota_fiscal_tiny(id_nota, filial=filial_resolvida)
+
+    if incluir_cancelamento and resultado.get("xml_cancelamento"):
+        conteudo = resultado["xml_cancelamento"] or ""
+        sufixo = "cancelamento"
+    else:
+        conteudo = resultado["xml_nfe"] or ""
+        sufixo = "nfe"
+
+    nome = f"xml_{nome_seguro_arquivo(id_nota)}_{sufixo}.xml"
+    return Response(
+        content=conteudo.encode("utf-8"),
+        media_type="application/xml; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{nome}"'},
+    )
+
+
+@app.get("/fiscal/xml/download")
+def fiscal_xml_download(
+    data_inicio: str = Query(..., description="YYYY-MM-DD"),
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    tipo: str = Query("ambos", description="nfe, nfce ou ambos"),
+    limite: int = Query(500, ge=1, le=2000, description="Máximo de XMLs neste ZIP."),
+    incluir_cancelamentos: bool = Query(True),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual),
+):
+    filial_resolvida = resolver_filial_autorizada(filial, usuario, permitir_all=False)
+    inicio = parse_data(data_inicio)
+    fim = parse_data(data_fim)
+    tipo_normalizado = safe_str(tipo).lower().strip()
+
+    if fim < inicio:
+        raise HTTPException(status_code=400, detail="data_fim não pode ser menor que data_inicio.")
+    if tipo_normalizado not in ["nfe", "nfce", "ambos"]:
+        raise HTTPException(status_code=400, detail="tipo deve ser nfe, nfce ou ambos.")
+    if (fim - inicio).days > 92:
+        raise HTTPException(
+            status_code=400,
+            detail="Para download em ZIP, selecione no máximo 93 dias por operação.",
+        )
+
+    notas = buscar_notas_fiscais_periodo_tiny(
+        inicio,
+        fim,
+        filial=filial_resolvida,
+    )
+
+    notas_filtradas = []
+    for nota in notas:
+        modelo = modelo_nota_pela_chave(nota.get("chave_acesso"))
+        if tipo_normalizado == "ambos" and modelo in ["nfe", "nfce"]:
+            notas_filtradas.append(nota)
+        elif modelo == tipo_normalizado:
+            notas_filtradas.append(nota)
+
+    total_encontrado = len(notas_filtradas)
+    notas_processadas = notas_filtradas[:limite]
+
+    buffer = io.BytesIO()
+    erros: List[Dict[str, Any]] = []
+    baixados = 0
+
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as arquivo_zip:
+        for indice, nota in enumerate(notas_processadas, start=1):
+            id_nota = safe_str(nota.get("id")).strip()
+            modelo = modelo_nota_pela_chave(nota.get("chave_acesso"))
+            pasta = "NFE" if modelo == "nfe" else "NFCE"
+
+            if not id_nota:
+                erros.append({"id": None, "numero": nota.get("numero"), "erro": "Nota sem ID interno."})
+                continue
+
+            try:
+                xmls = obter_xml_nota_fiscal_tiny(id_nota, filial=filial_resolvida)
+                numero = nome_seguro_arquivo(nota.get("numero"), id_nota)
+                serie = nome_seguro_arquivo(nota.get("serie"), "sem_serie")
+                chave = nome_seguro_arquivo(nota.get("chave_acesso"), id_nota)
+                nome_base = f"{numero}_serie_{serie}_{chave}"
+
+                arquivo_zip.writestr(
+                    f"{pasta}/{nome_base}.xml",
+                    (xmls.get("xml_nfe") or "").encode("utf-8"),
+                )
+                baixados += 1
+
+                if incluir_cancelamentos and xmls.get("xml_cancelamento"):
+                    arquivo_zip.writestr(
+                        f"{pasta}/CANCELAMENTOS/{nome_base}_cancelamento.xml",
+                        (xmls.get("xml_cancelamento") or "").encode("utf-8"),
+                    )
+
+            except HTTPException as exc:
+                erros.append({
+                    "id": id_nota,
+                    "numero": nota.get("numero"),
+                    "erro": exc.detail,
+                })
+            except Exception as exc:
+                erros.append({
+                    "id": id_nota,
+                    "numero": nota.get("numero"),
+                    "erro": str(exc),
+                })
+
+            # Pequena pausa reduz bloqueios da API 2.0 em downloads grandes.
+            if indice < len(notas_processadas):
+                time.sleep(0.25)
+
+        manifesto = {
+            "filial": filial_resolvida,
+            "data_inicio": inicio.isoformat(),
+            "data_fim": fim.isoformat(),
+            "tipo": tipo_normalizado,
+            "total_encontrado": total_encontrado,
+            "limite_solicitado": limite,
+            "total_processado": len(notas_processadas),
+            "xmls_baixados": baixados,
+            "erros": len(erros),
+            "download_parcial": total_encontrado > limite,
+            "gerado_em": datetime.now().isoformat(),
+        }
+        arquivo_zip.writestr(
+            "manifesto.json",
+            json.dumps(manifesto, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        if erros:
+            arquivo_zip.writestr(
+                "erros.json",
+                json.dumps(erros, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+            )
+
+    buffer.seek(0)
+    nome_zip = (
+        f"xml_{filial_resolvida}_{tipo_normalizado}_"
+        f"{inicio.isoformat()}_{fim.isoformat()}.zip"
+    )
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{nome_zip}"',
+            "X-XML-Encontrados": str(total_encontrado),
+            "X-XML-Baixados": str(baixados),
+            "X-XML-Erros": str(len(erros)),
+            "X-Download-Parcial": "true" if total_encontrado > limite else "false",
+        },
+    )
 
 
 # ============================================================
