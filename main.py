@@ -25,7 +25,7 @@ from app.modules.tributario.router import router as tributario_router
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.4.0",
+    version="2.5.0",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
@@ -1694,6 +1694,22 @@ class PeriodoBody(BaseModel):
 # MODELOS — REGRAS TRIBUTÁRIAS
 # ============================================================
 
+
+
+class FiscalMotorSimularBody(BaseModel):
+    produto_id: Optional[str] = None
+    ncm: Optional[str] = None
+    uf_origem: str
+    uf_destino: str
+    operacao: str = "venda"
+    regime: str
+    filial: Optional[str] = None
+    consumidor_final: Optional[bool] = None
+    contribuinte_icms: Optional[bool] = None
+    pessoa_fisica: Optional[bool] = None
+    marketplace: Optional[bool] = None
+    data_operacao: Optional[str] = None
+
 class FiscalRegraBase(BaseModel):
     empresa_id: Optional[str] = None
     filial: str = "sp"
@@ -2141,6 +2157,273 @@ def listar_historico_regra_fiscal(
     return {"status": "ok", "quantidade": len(dados), "dados": dados}
 
 
+
+
+# ============================================================
+# MOTOR TRIBUTÁRIO
+# ============================================================
+
+def _valor_booleano_compativel(valor_regra: Any, valor_entrada: Optional[bool]) -> bool:
+    """Campo nulo na regra funciona como curinga; valor definido exige igualdade."""
+    if valor_regra is None:
+        return True
+    if valor_entrada is None:
+        return False
+    return bool(valor_regra) == bool(valor_entrada)
+
+
+def _data_vigencia_compativel(regra: Dict[str, Any], data_operacao: date) -> bool:
+    inicio = regra.get("vigencia_inicio")
+    fim = regra.get("vigencia_fim")
+    if inicio and data_operacao < parse_data(safe_str(inicio)[:10]):
+        return False
+    if fim and data_operacao > parse_data(safe_str(fim)[:10]):
+        return False
+    return True
+
+
+def _campo_texto_compativel(valor_regra: Any, valor_entrada: Optional[str]) -> bool:
+    """Campo vazio/nulo na regra funciona como curinga."""
+    regra_txt = safe_str(valor_regra).strip().upper()
+    entrada_txt = safe_str(valor_entrada).strip().upper()
+    return not regra_txt or regra_txt == entrada_txt
+
+
+def _calcular_especificidade_regra(
+    regra: Dict[str, Any],
+    produto_especifico: bool,
+    ncm_entrada: Optional[str],
+    uf_origem: str,
+    uf_destino: str,
+    contexto: Dict[str, Optional[bool]]
+) -> int:
+    """Quanto maior, mais específica é a regra."""
+    pontos = 0
+    if produto_especifico:
+        pontos += 1000
+    if regra.get("ncm") and safe_str(regra.get("ncm")) == safe_str(ncm_entrada):
+        pontos += 300
+    if regra.get("uf_origem") and safe_str(regra.get("uf_origem")).upper() == uf_origem:
+        pontos += 100
+    if regra.get("uf_destino") and safe_str(regra.get("uf_destino")).upper() == uf_destino:
+        pontos += 100
+    if regra.get("categoria_id"):
+        pontos += 20
+    for campo, valor in contexto.items():
+        if regra.get(campo) is not None and valor is not None:
+            pontos += 10
+    if safe_str(regra.get("filial")).lower() != "all":
+        pontos += 5
+    return pontos
+
+
+def resolver_regra_tributaria(
+    *,
+    produto_id: Optional[str],
+    ncm: Optional[str],
+    uf_origem: str,
+    uf_destino: str,
+    operacao: str,
+    regime: str,
+    filial: str,
+    consumidor_final: Optional[bool],
+    contribuinte_icms: Optional[bool],
+    pessoa_fisica: Optional[bool],
+    marketplace: Optional[bool],
+    data_operacao: date
+) -> Dict[str, Any]:
+    """Resolve a melhor regra ativa usando especificidade e prioridade."""
+    params: Dict[str, str] = {
+        "select": "*",
+        "ativa": "eq.true",
+        "regime_tributario": f"eq.{regime}",
+        "tipo_operacao": f"eq.{operacao}",
+        "order": "prioridade.asc,created_at.desc",
+        "limit": "1000",
+    }
+    if filial != "all":
+        params["filial"] = f"in.({filial},all)"
+
+    regras = supabase_get("fiscal_regras", params)
+
+    ids_regras_produto = set()
+    if produto_id:
+        vinculos = supabase_get(
+            "fiscal_regras_produtos",
+            {
+                "select": "regra_id",
+                "produto_id": f"eq.{produto_id}",
+                "limit": "1000",
+            },
+        )
+        ids_regras_produto = {safe_str(v.get("regra_id")) for v in vinculos}
+
+    contexto = {
+        "consumidor_final": consumidor_final,
+        "contribuinte_icms": contribuinte_icms,
+        "pessoa_fisica": pessoa_fisica,
+        "marketplace": marketplace,
+    }
+
+    candidatas = []
+    descartes = {
+        "vigencia": 0, "ncm": 0, "uf": 0, "contexto": 0, "produto": 0
+    }
+
+    for regra in regras:
+        regra_id = safe_str(regra.get("id"))
+        tem_vinculos = bool(supabase_get(
+            "fiscal_regras_produtos",
+            {"select": "id", "regra_id": f"eq.{regra_id}", "limit": "1"}
+        ))
+        produto_especifico = regra_id in ids_regras_produto
+
+        # Regra ligada a produto não pode ser aplicada a outro produto.
+        if tem_vinculos and not produto_especifico:
+            descartes["produto"] += 1
+            continue
+        if not _data_vigencia_compativel(regra, data_operacao):
+            descartes["vigencia"] += 1
+            continue
+        if not _campo_texto_compativel(regra.get("ncm"), ncm):
+            descartes["ncm"] += 1
+            continue
+        if not _campo_texto_compativel(regra.get("uf_origem"), uf_origem):
+            descartes["uf"] += 1
+            continue
+        if not _campo_texto_compativel(regra.get("uf_destino"), uf_destino):
+            descartes["uf"] += 1
+            continue
+        if not all(_valor_booleano_compativel(regra.get(c), v) for c, v in contexto.items()):
+            descartes["contexto"] += 1
+            continue
+
+        especificidade = _calcular_especificidade_regra(
+            regra, produto_especifico, ncm, uf_origem, uf_destino, contexto
+        )
+        prioridade = int(regra.get("prioridade") or 100)
+        candidatas.append({
+            "regra": regra,
+            "produto_especifico": produto_especifico,
+            "especificidade": especificidade,
+            "prioridade": prioridade,
+        })
+
+    if not candidatas:
+        return {
+            "encontrou": False,
+            "regra": None,
+            "criterio": None,
+            "total_regras_avaliadas": len(regras),
+            "descartes": descartes,
+        }
+
+    candidatas.sort(key=lambda item: (-item["especificidade"], item["prioridade"], safe_str(item["regra"].get("created_at"))))
+    vencedora = candidatas[0]
+    regra = vencedora["regra"]
+
+    if vencedora["produto_especifico"]:
+        criterio = "produto"
+    elif regra.get("ncm") and regra.get("uf_origem") and regra.get("uf_destino"):
+        criterio = "ncm_uf"
+    elif regra.get("ncm"):
+        criterio = "ncm"
+    else:
+        criterio = "geral"
+
+    return {
+        "encontrou": True,
+        "regra": regra,
+        "criterio": criterio,
+        "especificidade": vencedora["especificidade"],
+        "prioridade": vencedora["prioridade"],
+        "total_regras_avaliadas": len(regras),
+        "total_candidatas": len(candidatas),
+        "descartes": descartes,
+    }
+
+
+@app.post("/fiscal/motor/simular")
+def simular_motor_tributario(
+    body: FiscalMotorSimularBody,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    payload = modelo_para_dict(body)
+    regime = safe_str(payload.get("regime")).strip().lower()
+    operacao = safe_str(payload.get("operacao") or "venda").strip().lower()
+    if regime not in REGIMES_TRIBUTARIOS_VALIDOS:
+        raise HTTPException(status_code=400, detail="Regime tributário inválido.")
+    if operacao not in TIPOS_OPERACAO_VALIDOS:
+        raise HTTPException(status_code=400, detail="Tipo de operação inválido.")
+
+    uf_origem = safe_str(payload.get("uf_origem")).strip().upper()
+    uf_destino = safe_str(payload.get("uf_destino")).strip().upper()
+    if uf_origem not in UFS_VALIDAS or uf_destino not in UFS_VALIDAS:
+        raise HTTPException(status_code=400, detail="UF de origem ou destino inválida.")
+
+    ncm = normalizar_codigo_numerico(payload.get("ncm"), 8)
+    if ncm and len(ncm) != 8:
+        raise HTTPException(status_code=400, detail="NCM deve possuir exatamente 8 dígitos.")
+
+    filial = resolver_filial_autorizada(payload.get("filial"), usuario, permitir_all=True)
+    data_operacao = parse_data(payload["data_operacao"]) if payload.get("data_operacao") else hoje_br()
+
+    resultado = resolver_regra_tributaria(
+        produto_id=safe_str(payload.get("produto_id")).strip() or None,
+        ncm=ncm,
+        uf_origem=uf_origem,
+        uf_destino=uf_destino,
+        operacao=operacao,
+        regime=regime,
+        filial=filial,
+        consumidor_final=payload.get("consumidor_final"),
+        contribuinte_icms=payload.get("contribuinte_icms"),
+        pessoa_fisica=payload.get("pessoa_fisica"),
+        marketplace=payload.get("marketplace"),
+        data_operacao=data_operacao,
+    )
+
+    if not resultado["encontrou"]:
+        return {
+            "status": "sem_regra",
+            "mensagem": "Nenhuma regra tributária compatível foi encontrada.",
+            "entrada": {**payload, "ncm": ncm, "filial": filial, "data_operacao": data_operacao.isoformat()},
+            "diagnostico": resultado,
+        }
+
+    regra = resultado["regra"]
+    return {
+        "status": "ok",
+        "encontrou": True,
+        "criterio": resultado["criterio"],
+        "regra_id": regra.get("id"),
+        "regra_nome": regra.get("nome"),
+        "filial_regra": regra.get("filial"),
+        "cfop": regra.get("cfop"),
+        "cst_icms": regra.get("cst_icms"),
+        "csosn": regra.get("csosn"),
+        "aliquota_icms": regra.get("aliquota_icms") or 0,
+        "reducao_bc": regra.get("reducao_bc") or 0,
+        "tem_st": bool(regra.get("tem_st")),
+        "mva": regra.get("mva") or 0,
+        "aliquota_fcp": regra.get("aliquota_fcp") or 0,
+        "cst_pis": regra.get("cst_pis"),
+        "aliquota_pis": regra.get("aliquota_pis") or 0,
+        "cst_cofins": regra.get("cst_cofins"),
+        "aliquota_cofins": regra.get("aliquota_cofins") or 0,
+        "cst_ipi": regra.get("cst_ipi"),
+        "aliquota_ipi": regra.get("aliquota_ipi") or 0,
+        "vigencia_inicio": regra.get("vigencia_inicio"),
+        "vigencia_fim": regra.get("vigencia_fim"),
+        "motor": {
+            "especificidade": resultado["especificidade"],
+            "prioridade": resultado["prioridade"],
+            "total_regras_avaliadas": resultado["total_regras_avaliadas"],
+            "total_candidatas": resultado["total_candidatas"],
+        },
+    }
+
+
 # ============================================================
 # ROTAS BÁSICAS
 # ============================================================
@@ -2150,7 +2433,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "version": "2.4.0"
+        "version": "2.5.0"
     }
 
 
@@ -2198,7 +2481,8 @@ def rotas():
             "/fiscal/xml/download",
             "/fiscal/regras",
             "/fiscal/regras/{regra_id}",
-            "/fiscal/regras/{regra_id}/historico"
+            "/fiscal/regras/{regra_id}/historico",
+            "/fiscal/motor/simular"
         ]
     }
 
