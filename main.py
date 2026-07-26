@@ -25,7 +25,7 @@ from app.modules.tributario.router import router as tributario_router
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.3.0",
+    version="2.4.0",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
@@ -1690,6 +1690,456 @@ class PeriodoBody(BaseModel):
     data_inicio: str
     data_fim: str
 
+# ============================================================
+# MODELOS — REGRAS TRIBUTÁRIAS
+# ============================================================
+
+class FiscalRegraBase(BaseModel):
+    empresa_id: Optional[str] = None
+    filial: str = "sp"
+    nome: str
+    descricao: Optional[str] = None
+    ativa: bool = True
+    prioridade: int = 100
+    regime_tributario: str
+    tipo_operacao: str = "venda"
+    uf_origem: Optional[str] = None
+    uf_destino: Optional[str] = None
+    categoria_id: Optional[str] = None
+    ncm: Optional[str] = None
+    cfop: Optional[str] = None
+    cst_icms: Optional[str] = None
+    csosn: Optional[str] = None
+    aliquota_icms: float = 0
+    reducao_bc: float = 0
+    tem_st: bool = False
+    mva: float = 0
+    aliquota_fcp: float = 0
+    cst_pis: Optional[str] = None
+    aliquota_pis: float = 0
+    cst_cofins: Optional[str] = None
+    aliquota_cofins: float = 0
+    cst_ipi: Optional[str] = None
+    aliquota_ipi: float = 0
+    consumidor_final: Optional[bool] = None
+    contribuinte_icms: Optional[bool] = None
+    pessoa_fisica: Optional[bool] = None
+    marketplace: Optional[bool] = None
+    vigencia_inicio: Optional[str] = None
+    vigencia_fim: Optional[str] = None
+    observacoes: Optional[str] = None
+    produtos: List[str] = []
+
+
+class FiscalRegraCriar(FiscalRegraBase):
+    pass
+
+
+class FiscalRegraAtualizar(BaseModel):
+    empresa_id: Optional[str] = None
+    filial: Optional[str] = None
+    nome: Optional[str] = None
+    descricao: Optional[str] = None
+    ativa: Optional[bool] = None
+    prioridade: Optional[int] = None
+    regime_tributario: Optional[str] = None
+    tipo_operacao: Optional[str] = None
+    uf_origem: Optional[str] = None
+    uf_destino: Optional[str] = None
+    categoria_id: Optional[str] = None
+    ncm: Optional[str] = None
+    cfop: Optional[str] = None
+    cst_icms: Optional[str] = None
+    csosn: Optional[str] = None
+    aliquota_icms: Optional[float] = None
+    reducao_bc: Optional[float] = None
+    tem_st: Optional[bool] = None
+    mva: Optional[float] = None
+    aliquota_fcp: Optional[float] = None
+    cst_pis: Optional[str] = None
+    aliquota_pis: Optional[float] = None
+    cst_cofins: Optional[str] = None
+    aliquota_cofins: Optional[float] = None
+    cst_ipi: Optional[str] = None
+    aliquota_ipi: Optional[float] = None
+    consumidor_final: Optional[bool] = None
+    contribuinte_icms: Optional[bool] = None
+    pessoa_fisica: Optional[bool] = None
+    marketplace: Optional[bool] = None
+    vigencia_inicio: Optional[str] = None
+    vigencia_fim: Optional[str] = None
+    observacoes: Optional[str] = None
+    produtos: Optional[List[str]] = None
+
+
+def modelo_para_dict(modelo: BaseModel, exclude_unset: bool = False) -> Dict[str, Any]:
+    if hasattr(modelo, "model_dump"):
+        return modelo.model_dump(exclude_unset=exclude_unset)
+    return modelo.dict(exclude_unset=exclude_unset)
+
+
+REGIMES_TRIBUTARIOS_VALIDOS = {
+    "simples_nacional", "lucro_presumido", "lucro_real"
+}
+
+TIPOS_OPERACAO_VALIDOS = {
+    "venda", "compra", "transferencia", "devolucao",
+    "bonificacao", "industrializacao", "remessa"
+}
+
+UFS_VALIDAS = {
+    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO",
+    "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI",
+    "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"
+}
+
+CAMPOS_PERCENTUAIS_FISCAL = {
+    "aliquota_icms", "reducao_bc", "aliquota_fcp", "aliquota_pis",
+    "aliquota_cofins", "aliquota_ipi"
+}
+
+
+def normalizar_codigo_numerico(valor: Optional[str], tamanho_maximo: int) -> Optional[str]:
+    if valor is None:
+        return None
+    texto = re.sub(r"\D", "", safe_str(valor))
+    if not texto:
+        return None
+    if len(texto) > tamanho_maximo:
+        raise HTTPException(status_code=400, detail=f"Código inválido: máximo de {tamanho_maximo} dígitos.")
+    return texto
+
+
+def validar_payload_regra_fiscal(payload: Dict[str, Any], parcial: bool = False) -> Dict[str, Any]:
+    dados = dict(payload)
+
+    if "nome" in dados:
+        dados["nome"] = safe_str(dados.get("nome")).strip()
+        if not dados["nome"]:
+            raise HTTPException(status_code=400, detail="O nome da regra é obrigatório.")
+    elif not parcial:
+        raise HTTPException(status_code=400, detail="O nome da regra é obrigatório.")
+
+    if "filial" in dados and dados.get("filial") is not None:
+        filial_raw = safe_str(dados.get("filial")).strip().lower()
+        if filial_raw not in {"sp", "mg", "all"}:
+            raise HTTPException(status_code=400, detail="Filial inválida. Use sp, mg ou all.")
+        dados["filial"] = filial_raw
+
+    if "regime_tributario" in dados and dados.get("regime_tributario") is not None:
+        regime = safe_str(dados.get("regime_tributario")).strip().lower()
+        if regime not in REGIMES_TRIBUTARIOS_VALIDOS:
+            raise HTTPException(status_code=400, detail="Regime tributário inválido.")
+        dados["regime_tributario"] = regime
+    elif not parcial:
+        raise HTTPException(status_code=400, detail="O regime tributário é obrigatório.")
+
+    if "tipo_operacao" in dados and dados.get("tipo_operacao") is not None:
+        operacao = safe_str(dados.get("tipo_operacao")).strip().lower()
+        if operacao not in TIPOS_OPERACAO_VALIDOS:
+            raise HTTPException(status_code=400, detail="Tipo de operação inválido.")
+        dados["tipo_operacao"] = operacao
+
+    for campo_uf in ["uf_origem", "uf_destino"]:
+        if campo_uf in dados and dados.get(campo_uf) is not None:
+            uf = safe_str(dados.get(campo_uf)).strip().upper()
+            if uf and uf not in UFS_VALIDAS:
+                raise HTTPException(status_code=400, detail=f"{campo_uf} inválida.")
+            dados[campo_uf] = uf or None
+
+    if "ncm" in dados:
+        dados["ncm"] = normalizar_codigo_numerico(dados.get("ncm"), 8)
+    if "cfop" in dados:
+        dados["cfop"] = normalizar_codigo_numerico(dados.get("cfop"), 4)
+
+    for campo in ["cst_icms", "csosn", "cst_pis", "cst_cofins", "cst_ipi"]:
+        if campo in dados:
+            dados[campo] = normalizar_codigo_numerico(dados.get(campo), 3)
+
+    if "prioridade" in dados and dados.get("prioridade") is not None:
+        if int(dados["prioridade"]) < 0:
+            raise HTTPException(status_code=400, detail="A prioridade não pode ser negativa.")
+        dados["prioridade"] = int(dados["prioridade"])
+
+    for campo in CAMPOS_PERCENTUAIS_FISCAL:
+        if campo in dados and dados.get(campo) is not None:
+            valor = float(dados[campo])
+            if valor < 0 or valor > 100:
+                raise HTTPException(status_code=400, detail=f"{campo} deve estar entre 0 e 100.")
+            dados[campo] = valor
+
+    if "mva" in dados and dados.get("mva") is not None:
+        dados["mva"] = float(dados["mva"])
+        if dados["mva"] < 0:
+            raise HTTPException(status_code=400, detail="MVA não pode ser negativa.")
+
+    for campo_data in ["vigencia_inicio", "vigencia_fim"]:
+        if campo_data in dados and dados.get(campo_data):
+            dados[campo_data] = parse_data(safe_str(dados[campo_data])).isoformat()
+
+    inicio = dados.get("vigencia_inicio")
+    fim = dados.get("vigencia_fim")
+    if inicio and fim and fim < inicio:
+        raise HTTPException(status_code=400, detail="vigencia_fim não pode ser menor que vigencia_inicio.")
+
+    return dados
+
+
+def usuario_id_uuid_ou_none(usuario: Dict[str, Any]) -> Optional[str]:
+    valor = safe_str(usuario.get("id")).strip()
+    return valor if re.fullmatch(r"[0-9a-fA-F-]{36}", valor) else None
+
+
+def registrar_historico_fiscal(
+    regra_id: str,
+    usuario: Dict[str, Any],
+    acao: str,
+    antes: Optional[Dict[str, Any]] = None,
+    depois: Optional[Dict[str, Any]] = None,
+    observacoes: Optional[str] = None
+):
+    payload = {
+        "regra_id": regra_id,
+        "usuario_id": usuario_id_uuid_ou_none(usuario),
+        "usuario_nome": usuario.get("nome") or usuario.get("email") or "Sistema",
+        "acao": acao,
+        "antes": antes,
+        "depois": depois,
+        "observacoes": observacoes,
+        "created_at": datetime.now().isoformat()
+    }
+    supabase_insert("fiscal_historico", payload)
+
+
+def buscar_regra_fiscal_por_id(regra_id: str) -> Dict[str, Any]:
+    registros = supabase_get(
+        "fiscal_regras",
+        {"id": f"eq.{regra_id}", "select": "*", "limit": "1"}
+    )
+    if not registros:
+        raise HTTPException(status_code=404, detail="Regra tributária não encontrada.")
+    return registros[0]
+
+
+def buscar_produtos_da_regra(regra_id: str) -> List[str]:
+    vinculos = supabase_get(
+        "fiscal_regras_produtos",
+        {
+            "regra_id": f"eq.{regra_id}",
+            "select": "produto_id",
+            "order": "created_at.asc"
+        }
+    )
+    return [safe_str(item.get("produto_id")) for item in vinculos if item.get("produto_id")]
+
+
+def substituir_produtos_da_regra(regra_id: str, produtos: Optional[List[str]]):
+    if produtos is None:
+        return
+
+    supabase_delete("fiscal_regras_produtos", {"regra_id": f"eq.{regra_id}"})
+    produtos_limpos = list(dict.fromkeys(
+        safe_str(produto).strip() for produto in produtos if safe_str(produto).strip()
+    ))
+    if produtos_limpos:
+        supabase_insert(
+            "fiscal_regras_produtos",
+            [{"regra_id": regra_id, "produto_id": produto} for produto in produtos_limpos]
+        )
+
+
+def validar_acesso_regra_fiscal(regra: Dict[str, Any], usuario: Dict[str, Any]):
+    filial_usuario = normalizar_filial(usuario.get("filial") or "sp")
+    filial_regra = normalizar_filial(regra.get("filial") or "sp")
+    if filial_usuario != "all" and filial_regra not in {filial_usuario, "all"}:
+        raise HTTPException(status_code=403, detail="Usuário sem permissão para acessar esta regra.")
+
+
+# ============================================================
+# ROTAS — CRUD DE REGRAS TRIBUTÁRIAS
+# ============================================================
+
+@app.get("/fiscal/regras")
+def listar_regras_fiscais(
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    regime_tributario: Optional[str] = Query(None),
+    tipo_operacao: Optional[str] = Query(None),
+    ncm: Optional[str] = Query(None),
+    ativa: Optional[bool] = Query(None),
+    busca: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    filial_resolvida = resolver_filial_autorizada(filial, usuario, permitir_all=True)
+    params: Dict[str, str] = {
+        "select": "*",
+        "order": "prioridade.asc,nome.asc",
+        "limit": str(limit),
+        "offset": str(offset)
+    }
+
+    if filial_resolvida != "all":
+        # Regras globais também valem para a filial selecionada.
+        params["filial"] = f"in.({filial_resolvida},all)"
+    if regime_tributario:
+        params["regime_tributario"] = f"eq.{safe_str(regime_tributario).lower().strip()}"
+    if tipo_operacao:
+        params["tipo_operacao"] = f"eq.{safe_str(tipo_operacao).lower().strip()}"
+    if ncm:
+        params["ncm"] = f"eq.{normalizar_codigo_numerico(ncm, 8)}"
+    if ativa is not None:
+        params["ativa"] = f"eq.{str(ativa).lower()}"
+    if busca and safe_str(busca).strip():
+        termo = safe_str(busca).strip().replace(",", " ")
+        params["or"] = f"(nome.ilike.*{termo}*,descricao.ilike.*{termo}*,ncm.ilike.*{termo}*)"
+
+    regras = supabase_get("fiscal_regras", params)
+    return {
+        "status": "ok",
+        "filial": filial_resolvida,
+        "quantidade": len(regras),
+        "dados": regras
+    }
+
+
+@app.get("/fiscal/regras/{regra_id}")
+def obter_regra_fiscal(
+    regra_id: str,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    regra = buscar_regra_fiscal_por_id(regra_id)
+    validar_acesso_regra_fiscal(regra, usuario)
+    regra["produtos"] = buscar_produtos_da_regra(regra_id)
+    return {"status": "ok", "dados": regra}
+
+
+@app.post("/fiscal/regras", status_code=201)
+def criar_regra_fiscal(
+    body: FiscalRegraCriar,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    payload = modelo_para_dict(body)
+    produtos = payload.pop("produtos", [])
+    payload = validar_payload_regra_fiscal(payload, parcial=False)
+
+    filial_regra = resolver_filial_autorizada(payload.get("filial"), usuario, permitir_all=True)
+    payload["filial"] = filial_regra
+    payload["created_by"] = usuario_id_uuid_ou_none(usuario)
+    payload["updated_by"] = usuario_id_uuid_ou_none(usuario)
+    payload["created_at"] = datetime.now().isoformat()
+    payload["updated_at"] = datetime.now().isoformat()
+
+    criado = supabase_insert("fiscal_regras", payload)
+    if not criado:
+        raise HTTPException(status_code=500, detail="Supabase não retornou a regra criada.")
+
+    regra = criado[0] if isinstance(criado, list) else criado
+    regra_id = safe_str(regra.get("id"))
+    substituir_produtos_da_regra(regra_id, produtos)
+    regra["produtos"] = buscar_produtos_da_regra(regra_id)
+    registrar_historico_fiscal(regra_id, usuario, "criou", depois=regra)
+
+    return {"status": "ok", "mensagem": "Regra tributária criada.", "dados": regra}
+
+
+@app.put("/fiscal/regras/{regra_id}")
+def atualizar_regra_fiscal(
+    regra_id: str,
+    body: FiscalRegraAtualizar,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    anterior = buscar_regra_fiscal_por_id(regra_id)
+    validar_acesso_regra_fiscal(anterior, usuario)
+    anterior_completo = dict(anterior)
+    anterior_completo["produtos"] = buscar_produtos_da_regra(regra_id)
+
+    payload = modelo_para_dict(body, exclude_unset=True)
+    produtos_informados = "produtos" in payload
+    produtos = payload.pop("produtos", None)
+    payload = validar_payload_regra_fiscal(payload, parcial=True)
+
+    if "filial" in payload:
+        payload["filial"] = resolver_filial_autorizada(payload["filial"], usuario, permitir_all=True)
+
+    if not payload and not produtos_informados:
+        raise HTTPException(status_code=400, detail="Nenhum campo foi informado para atualização.")
+
+    if payload:
+        payload["updated_by"] = usuario_id_uuid_ou_none(usuario)
+        payload["updated_at"] = datetime.now().isoformat()
+        atualizado = supabase_patch("fiscal_regras", {"id": f"eq.{regra_id}"}, payload)
+        regra = atualizado[0] if isinstance(atualizado, list) and atualizado else buscar_regra_fiscal_por_id(regra_id)
+    else:
+        regra = buscar_regra_fiscal_por_id(regra_id)
+
+    if produtos_informados:
+        substituir_produtos_da_regra(regra_id, produtos)
+
+    regra = buscar_regra_fiscal_por_id(regra_id)
+    regra["produtos"] = buscar_produtos_da_regra(regra_id)
+
+    acao = "editou"
+    if anterior.get("ativa") is False and regra.get("ativa") is True:
+        acao = "ativou"
+    elif anterior.get("ativa") is True and regra.get("ativa") is False:
+        acao = "desativou"
+
+    registrar_historico_fiscal(regra_id, usuario, acao, antes=anterior_completo, depois=regra)
+    return {"status": "ok", "mensagem": "Regra tributária atualizada.", "dados": regra}
+
+
+@app.delete("/fiscal/regras/{regra_id}")
+def excluir_regra_fiscal(
+    regra_id: str,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    anterior = buscar_regra_fiscal_por_id(regra_id)
+    validar_acesso_regra_fiscal(anterior, usuario)
+    anterior["produtos"] = buscar_produtos_da_regra(regra_id)
+
+    # Exclusão lógica: preserva histórico e evita quebrar auditorias antigas.
+    atualizado = supabase_patch(
+        "fiscal_regras",
+        {"id": f"eq.{regra_id}"},
+        {
+            "ativa": False,
+            "updated_by": usuario_id_uuid_ou_none(usuario),
+            "updated_at": datetime.now().isoformat()
+        }
+    )
+    regra = atualizado[0] if isinstance(atualizado, list) and atualizado else buscar_regra_fiscal_por_id(regra_id)
+    regra["produtos"] = buscar_produtos_da_regra(regra_id)
+    registrar_historico_fiscal(
+        regra_id, usuario, "desativou", antes=anterior, depois=regra,
+        observacoes="Exclusão lógica realizada pelo endpoint DELETE."
+    )
+    return {
+        "status": "ok",
+        "mensagem": "Regra tributária desativada com sucesso.",
+        "dados": regra
+    }
+
+
+@app.get("/fiscal/regras/{regra_id}/historico")
+def listar_historico_regra_fiscal(
+    regra_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    regra = buscar_regra_fiscal_por_id(regra_id)
+    validar_acesso_regra_fiscal(regra, usuario)
+    dados = supabase_get(
+        "fiscal_historico",
+        {
+            "regra_id": f"eq.{regra_id}",
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": str(limit)
+        }
+    )
+    return {"status": "ok", "quantidade": len(dados), "dados": dados}
+
 
 # ============================================================
 # ROTAS BÁSICAS
@@ -1700,7 +2150,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "version": "2.3.0"
+        "version": "2.4.0"
     }
 
 
@@ -1745,7 +2195,10 @@ def rotas():
         "fiscal": [
             "/fiscal/xml/resumo",
             "/fiscal/xml/nota",
-            "/fiscal/xml/download"
+            "/fiscal/xml/download",
+            "/fiscal/regras",
+            "/fiscal/regras/{regra_id}",
+            "/fiscal/regras/{regra_id}/historico"
         ]
     }
 
