@@ -201,6 +201,21 @@ def excluir_regra(
     return service.excluir_regra(regra_id)
 
 
+
+@router.get("/ncms-utilizados")
+def ncms_utilizados(
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    incluir_sem_ncm: bool = Query(False),
+    limite: int = Query(1000, ge=1, le=10000),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    filial_resolvida = service.resolver_filial_autorizada(filial, usuario)
+    return service.listar_ncms_utilizados(
+        filial=filial_resolvida,
+        incluir_sem_ncm=incluir_sem_ncm,
+        limite=limite,
+    )
+
 # ============================================================
 # AUDITORIA TRIBUTÁRIA
 # ============================================================
