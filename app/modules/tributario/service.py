@@ -458,6 +458,68 @@ def supabase_get(params: Any) -> List[Dict[str, Any]]:
     return dados if isinstance(dados, list) else []
 
 
+def supabase_get_todos(
+    params_base: Any,
+    tamanho_pagina: int = 1000,
+    limite_total: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Lê todos os registros de produtos_tributarios usando paginação.
+
+    O Supabase pode limitar cada resposta a 100 ou 1.000 linhas, mesmo
+    quando o parâmetro limit é maior. Por isso, avançamos pelo número
+    real de registros recebidos até a página ficar vazia.
+    """
+    if tamanho_pagina < 1 or tamanho_pagina > 10000:
+        raise HTTPException(
+            status_code=400,
+            detail="tamanho_pagina deve estar entre 1 e 10000.",
+        )
+
+    params_fixos = [
+        (str(chave), str(valor))
+        for chave, valor in list(params_base)
+        if str(chave) not in {"limit", "offset"}
+    ]
+
+    registros: List[Dict[str, Any]] = []
+    offset = 0
+
+    while True:
+        restante = None
+        if limite_total is not None:
+            restante = limite_total - len(registros)
+            if restante <= 0:
+                break
+
+        tamanho_solicitado = (
+            min(tamanho_pagina, restante)
+            if restante is not None
+            else tamanho_pagina
+        )
+
+        params = [
+            *params_fixos,
+            ("limit", str(tamanho_solicitado)),
+            ("offset", str(offset)),
+        ]
+        pagina = supabase_get(params)
+
+        if not pagina:
+            break
+
+        registros.extend(pagina)
+        offset += len(pagina)
+
+        # Quando o limite total foi atingido, encerramos. Não usamos
+        # len(pagina) < tamanho_solicitado como condição porque o projeto
+        # Supabase pode impor um teto menor por resposta.
+        if limite_total is not None and len(registros) >= limite_total:
+            break
+
+    return registros
+
+
 def limpar_payload_banco(dados: Dict[str, Any]) -> Dict[str, Any]:
     """
     Remove campos que não existem na tabela.
@@ -1963,8 +2025,11 @@ def listar_ncms_utilizados(
     limite: int = 1000,
 ) -> Dict[str, Any]:
     """
-    Agrupa os NCMs existentes em produtos_tributarios e informa se
-    já existe ao menos uma regra ativa cadastrada para cada NCM.
+    Lê todos os produtos da filial, agrupa por NCM e informa se existe
+    regra tributária ativa cadastrada para cada código.
+
+    O parâmetro limite restringe a quantidade de NCMs devolvidos, e não
+    a quantidade de produtos lidos.
     """
     if limite < 1 or limite > 10000:
         raise HTTPException(
@@ -1975,13 +2040,16 @@ def listar_ncms_utilizados(
     filial_normalizada = normalizar_filial(filial)
 
     params_produtos: List[Tuple[str, str]] = [
-        ("select", "ncm,descricao,sku,codigo,ativo"),
-        ("limit", "10000"),
+        ("select", "id,filial,ncm,descricao,sku,codigo,ativo,preco,custo,fornecedor"),
+        ("order", "id.asc"),
     ]
     if filial_normalizada != "all":
         params_produtos.append(("filial", f"eq.{filial_normalizada}"))
 
-    produtos = supabase_get(params_produtos)
+    produtos = supabase_get_todos(
+        params_produtos,
+        tamanho_pagina=1000,
+    )
 
     regras_ativas = _supabase_request_tabela(
         "GET",
@@ -2031,6 +2099,7 @@ def listar_ncms_utilizados(
                 "produtos_ativos": 0,
                 "regra_cadastrada": False,
                 "quantidade_regras_ativas": 0,
+                "fornecedores_distintos": set(),
                 "exemplos_produtos": [],
             },
         )
@@ -2038,6 +2107,10 @@ def listar_ncms_utilizados(
         item["quantidade_produtos"] += 1
         if produto.get("ativo") is True:
             item["produtos_ativos"] += 1
+
+        fornecedor = safe_str(produto.get("fornecedor"))
+        if fornecedor:
+            item["fornecedores_distintos"].add(fornecedor)
 
         if len(item["exemplos_produtos"]) < 3:
             item["exemplos_produtos"].append(
@@ -2049,25 +2122,27 @@ def listar_ncms_utilizados(
             )
 
     for chave, item in agrupados.items():
-        if chave == "SEM_NCM" or len(chave) != 8:
-            continue
-        regras = regras_por_ncm.get(chave, [])
-        item["regra_cadastrada"] = bool(regras)
-        item["quantidade_regras_ativas"] = len(regras)
+        if chave != "SEM_NCM" and len(chave) == 8:
+            regras = regras_por_ncm.get(chave, [])
+            item["regra_cadastrada"] = bool(regras)
+            item["quantidade_regras_ativas"] = len(regras)
 
-    lista = sorted(
+        item["fornecedores_distintos"] = len(item["fornecedores_distintos"])
+
+    lista_completa = sorted(
         agrupados.values(),
         key=lambda item: (-item["quantidade_produtos"], item.get("ncm") or ""),
-    )[:limite]
+    )
+    lista = lista_completa[:limite]
 
     total_com_regra = sum(
         item["quantidade_produtos"]
-        for item in lista
+        for item in lista_completa
         if item["regra_cadastrada"]
     )
     total_sem_regra = sum(
         item["quantidade_produtos"]
-        for item in lista
+        for item in lista_completa
         if item["status_ncm"] == "valido" and not item["regra_cadastrada"]
     )
 
@@ -2075,10 +2150,14 @@ def listar_ncms_utilizados(
         "status": "ok",
         "filial": filial_normalizada,
         "total_produtos_lidos": len(produtos),
-        "total_ncms_distintos": sum(1 for item in agrupados.values() if item["status_ncm"] == "valido"),
+        "total_ncms_distintos": sum(
+            1 for item in lista_completa if item["status_ncm"] == "valido"
+        ),
+        "total_ncms_retornados": len(lista),
         "produtos_com_regra_cadastrada": total_com_regra,
         "produtos_sem_regra_cadastrada": total_sem_regra,
         "produtos_sem_ncm": produtos_sem_ncm,
         "produtos_com_ncm_invalido": produtos_ncm_invalido,
         "ncms": lista,
     }
+
