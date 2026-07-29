@@ -1951,3 +1951,134 @@ def obter_resumo_auditoria(filial: str) -> Dict[str, Any]:
         ),
         "ultima_auditoria": ultima_auditoria,
     }
+
+
+# ============================================================
+# NCMs UTILIZADOS NOS PRODUTOS
+# ============================================================
+
+def listar_ncms_utilizados(
+    filial: str,
+    incluir_sem_ncm: bool = False,
+    limite: int = 1000,
+) -> Dict[str, Any]:
+    """
+    Agrupa os NCMs existentes em produtos_tributarios e informa se
+    já existe ao menos uma regra ativa cadastrada para cada NCM.
+    """
+    if limite < 1 or limite > 10000:
+        raise HTTPException(
+            status_code=400,
+            detail="limite deve estar entre 1 e 10000.",
+        )
+
+    filial_normalizada = normalizar_filial(filial)
+
+    params_produtos: List[Tuple[str, str]] = [
+        ("select", "ncm,descricao,sku,codigo,ativo"),
+        ("limit", "10000"),
+    ]
+    if filial_normalizada != "all":
+        params_produtos.append(("filial", f"eq.{filial_normalizada}"))
+
+    produtos = supabase_get(params_produtos)
+
+    regras_ativas = _supabase_request_tabela(
+        "GET",
+        TABELA_REGRAS,
+        params=[
+            ("select", "ncm,id,status,percentual_confianca"),
+            ("ativo", "eq.true"),
+            ("limit", "10000"),
+        ],
+    )
+
+    regras_por_ncm: Dict[str, List[Dict[str, Any]]] = {}
+    for regra in regras_ativas or []:
+        ncm_regra = ncm_limpo(regra.get("ncm"))
+        if len(ncm_regra) == 8:
+            regras_por_ncm.setdefault(ncm_regra, []).append(regra)
+
+    agrupados: Dict[str, Dict[str, Any]] = {}
+    produtos_sem_ncm = 0
+    produtos_ncm_invalido = 0
+
+    for produto in produtos:
+        ncm = ncm_limpo(produto.get("ncm"))
+
+        if not ncm:
+            produtos_sem_ncm += 1
+            if not incluir_sem_ncm:
+                continue
+            chave = "SEM_NCM"
+            status = "sem_ncm"
+        elif len(ncm) != 8:
+            produtos_ncm_invalido += 1
+            if not incluir_sem_ncm:
+                continue
+            chave = ncm
+            status = "ncm_invalido"
+        else:
+            chave = ncm
+            status = "valido"
+
+        item = agrupados.setdefault(
+            chave,
+            {
+                "ncm": None if chave == "SEM_NCM" else chave,
+                "status_ncm": status,
+                "quantidade_produtos": 0,
+                "produtos_ativos": 0,
+                "regra_cadastrada": False,
+                "quantidade_regras_ativas": 0,
+                "exemplos_produtos": [],
+            },
+        )
+
+        item["quantidade_produtos"] += 1
+        if produto.get("ativo") is True:
+            item["produtos_ativos"] += 1
+
+        if len(item["exemplos_produtos"]) < 3:
+            item["exemplos_produtos"].append(
+                {
+                    "descricao": produto.get("descricao"),
+                    "sku": produto.get("sku"),
+                    "codigo": produto.get("codigo"),
+                }
+            )
+
+    for chave, item in agrupados.items():
+        if chave == "SEM_NCM" or len(chave) != 8:
+            continue
+        regras = regras_por_ncm.get(chave, [])
+        item["regra_cadastrada"] = bool(regras)
+        item["quantidade_regras_ativas"] = len(regras)
+
+    lista = sorted(
+        agrupados.values(),
+        key=lambda item: (-item["quantidade_produtos"], item.get("ncm") or ""),
+    )[:limite]
+
+    total_com_regra = sum(
+        item["quantidade_produtos"]
+        for item in lista
+        if item["regra_cadastrada"]
+    )
+    total_sem_regra = sum(
+        item["quantidade_produtos"]
+        for item in lista
+        if item["status_ncm"] == "valido" and not item["regra_cadastrada"]
+    )
+
+    return {
+        "status": "ok",
+        "filial": filial_normalizada,
+        "total_produtos_lidos": len(produtos),
+        "total_ncms_distintos": sum(1 for item in agrupados.values() if item["status_ncm"] == "valido"),
+        "produtos_com_regra_cadastrada": total_com_regra,
+        "produtos_sem_regra_cadastrada": total_sem_regra,
+        "produtos_sem_ncm": produtos_sem_ncm,
+        "produtos_com_ncm_invalido": produtos_ncm_invalido,
+        "ncms": lista,
+    }
