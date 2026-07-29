@@ -209,7 +209,18 @@ def ncms_utilizados(
     limite: int = Query(1000, ge=1, le=10000),
     usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
 ):
-    filial_resolvida = service.resolver_filial_autorizada(filial, usuario)
+    # Em modo de implantação, o usuário técnico possui filial=all.
+    # Quando o Swagger não envia a filial, usamos SP como padrão; 
+    # filial=all continua disponível quando informada explicitamente.
+    filial_entrada = filial
+    if not service.safe_str(filial_entrada) and service.normalizar_filial(
+        usuario.get("filial") or "sp"
+    ) == "all":
+        filial_entrada = "sp"
+
+    filial_resolvida = service.resolver_filial_autorizada(
+        filial_entrada, usuario
+    )
     return service.listar_ncms_utilizados(
         filial=filial_resolvida,
         incluir_sem_ncm=incluir_sem_ncm,
