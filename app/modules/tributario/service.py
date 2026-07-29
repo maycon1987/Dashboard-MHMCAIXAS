@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -1426,8 +1426,8 @@ def listar_regras(
     limite: int = 100,
     offset: int = 0,
 ) -> List[Dict[str, Any]]:
-    if limite < 1 or limite > 1000:
-        raise HTTPException(status_code=400, detail="limite deve estar entre 1 e 1000.")
+    if limite < 1 or limite > 10000:
+        raise HTTPException(status_code=400, detail="limite deve estar entre 1 e 10000.")
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset não pode ser negativo.")
 
@@ -1599,4 +1599,355 @@ def buscar_regra_aplicavel(
         "data_referencia": referencia.isoformat(),
         "regra": aplicaveis[0],
         "total_regras_aplicaveis": len(aplicaveis),
+    }
+
+
+# ============================================================
+# AUDITORIA TRIBUTÁRIA
+# ============================================================
+
+TABELA_AUDITORIA = "auditoria_tributaria"
+
+
+def _valor_float_seguro(valor: Any) -> float:
+    try:
+        return float(valor or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _regra_esta_completa(regra: Dict[str, Any]) -> bool:
+    """Valida os campos mínimos para considerar a regra utilizável."""
+    possui_icms = bool(safe_str(regra.get("cst_icms")) or safe_str(regra.get("csosn")))
+    return all(
+        [
+            safe_str(regra.get("cfop")),
+            possui_icms,
+            safe_str(regra.get("cst_pis")),
+            safe_str(regra.get("cst_cofins")),
+        ]
+    )
+
+
+def _status_regra_para_auditoria(regra: Dict[str, Any]) -> Tuple[str, str]:
+    status_regra = safe_str(regra.get("status")).lower()
+    revisao_manual = bool(regra.get("revisao_manual"))
+    completa = _regra_esta_completa(regra)
+
+    if revisao_manual:
+        return "revisar", "A regra tributária exige revisão manual."
+
+    if not completa:
+        return "revisar", "A regra foi encontrada, mas possui campos tributários obrigatórios incompletos."
+
+    if status_regra in {"divergente", "erro", "revisao", "revisão", "pendente"}:
+        return "revisar", f"A regra tributária está com status '{status_regra or 'pendente'}'."
+
+    return "ok", "Produto vinculado a uma regra tributária aplicável e completa."
+
+
+def _buscar_regras_contexto_auditoria(
+    regime_tributario: str,
+    uf_origem: str,
+    uf_destino: str,
+    tipo_operacao: str,
+    finalidade: str,
+    consumidor_final: bool,
+    contribuinte_icms: bool,
+) -> List[Dict[str, Any]]:
+    params: List[Tuple[str, str]] = [
+        ("select", "*"),
+        ("regime_tributario", f"eq.{safe_str(regime_tributario).lower()}"),
+        ("uf_origem", f"eq.{_normalizar_uf(uf_origem, 'uf_origem')}"),
+        ("uf_destino", f"eq.{_normalizar_uf(uf_destino, 'uf_destino')}"),
+        ("tipo_operacao", f"eq.{safe_str(tipo_operacao).lower()}"),
+        ("finalidade", f"eq.{safe_str(finalidade).lower()}"),
+        ("consumidor_final", f"eq.{str(bool(consumidor_final)).lower()}"),
+        ("contribuinte_icms", f"eq.{str(bool(contribuinte_icms)).lower()}"),
+        ("ativo", "eq.true"),
+        ("order", "ncm.asc,vigencia_inicio.desc.nullslast,created_at.desc"),
+        ("limit", "10000"),
+    ]
+    dados = _supabase_request_tabela("GET", TABELA_REGRAS, params=params)
+    return dados if isinstance(dados, list) else []
+
+
+def _regra_vigente(regra: Dict[str, Any], referencia: date) -> bool:
+    try:
+        inicio = date.fromisoformat(regra["vigencia_inicio"]) if regra.get("vigencia_inicio") else None
+        fim = date.fromisoformat(regra["vigencia_fim"]) if regra.get("vigencia_fim") else None
+    except (TypeError, ValueError):
+        return False
+
+    if inicio and referencia < inicio:
+        return False
+    if fim and referencia > fim:
+        return False
+    return True
+
+
+def _salvar_auditorias(payload: List[Dict[str, Any]]) -> int:
+    if not payload:
+        return 0
+
+    total = 0
+    for inicio in range(0, len(payload), 200):
+        bloco = payload[inicio: inicio + 200]
+        salvos = _supabase_request_tabela(
+            "POST",
+            TABELA_AUDITORIA,
+            json=bloco,
+            prefer="return=representation",
+            timeout=120,
+        )
+        total += len(salvos) if isinstance(salvos, list) else len(bloco)
+    return total
+
+
+def auditar_tributacao(
+    filial: str,
+    regime_tributario: str = "lucro_presumido",
+    uf_origem: Optional[str] = None,
+    uf_destino: Optional[str] = None,
+    tipo_operacao: str = "venda",
+    finalidade: str = "revenda",
+    consumidor_final: bool = False,
+    contribuinte_icms: bool = True,
+    data_referencia: Optional[str] = None,
+    limite: int = 10000,
+) -> Dict[str, Any]:
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada == "all":
+        raise HTTPException(status_code=400, detail="Para auditar, use filial=sp ou filial=mg.")
+
+    if limite < 1 or limite > 10000:
+        raise HTTPException(status_code=400, detail="limite deve estar entre 1 e 10000.")
+
+    uf_padrao = "MG" if filial_normalizada == "mg" else "SP"
+    origem = _normalizar_uf(uf_origem or uf_padrao, "uf_origem")
+    destino = _normalizar_uf(uf_destino or uf_padrao, "uf_destino")
+
+    try:
+        referencia = date.fromisoformat(data_referencia) if data_referencia else date.today()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="data_referencia deve estar no formato YYYY-MM-DD.")
+
+    produtos = listar_produtos(
+        filial=filial_normalizada,
+        status_tributario=None,
+        status_ia=None,
+        lote=None,
+        busca=None,
+        limite=limite,
+        offset=0,
+    )
+
+    regras = _buscar_regras_contexto_auditoria(
+        regime_tributario=regime_tributario,
+        uf_origem=origem,
+        uf_destino=destino,
+        tipo_operacao=tipo_operacao,
+        finalidade=finalidade,
+        consumidor_final=consumidor_final,
+        contribuinte_icms=contribuinte_icms,
+    )
+
+    regras_por_ncm: Dict[str, List[Dict[str, Any]]] = {}
+    for regra in regras:
+        ncm_regra = ncm_limpo(regra.get("ncm"))
+        if ncm_regra and _regra_vigente(regra, referencia):
+            regras_por_ncm.setdefault(ncm_regra, []).append(regra)
+
+    agora = agora_iso()
+    auditorias: List[Dict[str, Any]] = []
+    produtos_atualizados: List[Dict[str, Any]] = []
+    contadores = {"ok": 0, "revisar": 0, "sem_regra": 0, "erro": 0}
+    confiancas: List[float] = []
+
+    for produto in produtos:
+        produto_id = safe_str(produto.get("id"))
+        ncm_produto = ncm_limpo(produto.get("ncm"))
+        regra: Optional[Dict[str, Any]] = None
+        status = "sem_regra"
+        confianca = 0.0
+        justificativa = "Produto sem NCM informado."
+
+        if ncm_produto and len(ncm_produto) != 8:
+            status = "revisar"
+            justificativa = "O NCM do produto é inválido; deve possuir exatamente 8 números."
+        elif ncm_produto:
+            candidatas = regras_por_ncm.get(ncm_produto, [])
+            regra = candidatas[0] if candidatas else None
+            if regra:
+                status, justificativa = _status_regra_para_auditoria(regra)
+                confianca = _valor_float_seguro(regra.get("percentual_confianca"))
+            else:
+                status = "sem_regra"
+                justificativa = "Nenhuma regra tributária aplicável foi encontrada para este NCM e contexto."
+
+        contadores[status] += 1
+        if confianca > 0:
+            confiancas.append(confianca)
+
+        auditorias.append(
+            {
+                "produto_id": produto_id,
+                "filial": filial_normalizada,
+                "regra_id": regra.get("id") if regra else None,
+                "tiny_produto_id": produto.get("tiny_produto_id"),
+                "sku": produto.get("sku"),
+                "codigo": produto.get("codigo"),
+                "descricao": produto.get("descricao"),
+                "ncm": ncm_produto or None,
+                "status": status,
+                "percentual_confianca": confianca,
+                "justificativa": justificativa,
+                "revisao_manual": bool(regra.get("revisao_manual")) if regra else False,
+                "data_auditoria": agora,
+                "updated_at": agora,
+            }
+        )
+
+        produto_atualizado = dict(produto)
+        produto_atualizado.pop("status_tributario", None)
+        produto_atualizado["status_ia"] = {
+            "ok": "CONCLUIDO",
+            "revisar": "REVISAO_MANUAL",
+            "sem_regra": "PENDENTE",
+            "erro": "ERRO",
+        }[status]
+        produto_atualizado["percentual_confianca"] = confianca
+        produto_atualizado["justificativa_ia"] = justificativa
+        produto_atualizado["data_analise"] = agora
+        produto_atualizado["updated_at"] = agora
+        produtos_atualizados.append(produto_atualizado)
+
+    auditorias_salvas = _salvar_auditorias(auditorias)
+
+    produtos_salvos = 0
+    for inicio in range(0, len(produtos_atualizados), 100):
+        bloco = produtos_atualizados[inicio: inicio + 100]
+        salvos = supabase_upsert(bloco)
+        produtos_salvos += len(salvos) if salvos else len(bloco)
+
+    confianca_media = round(sum(confiancas) / len(confiancas), 2) if confiancas else 0.0
+
+    return {
+        "status": "ok",
+        "filial": filial_normalizada,
+        "contexto": {
+            "regime_tributario": safe_str(regime_tributario).lower(),
+            "uf_origem": origem,
+            "uf_destino": destino,
+            "tipo_operacao": safe_str(tipo_operacao).lower(),
+            "finalidade": safe_str(finalidade).lower(),
+            "consumidor_final": consumidor_final,
+            "contribuinte_icms": contribuinte_icms,
+            "data_referencia": referencia.isoformat(),
+        },
+        "total_produtos": len(produtos),
+        "produtos_corretos": contadores["ok"],
+        "produtos_revisao": contadores["revisar"],
+        "produtos_sem_regra": contadores["sem_regra"],
+        "produtos_com_erro": contadores["erro"],
+        "confiabilidade_media": confianca_media,
+        "regras_carregadas": len(regras),
+        "auditorias_salvas": auditorias_salvas,
+        "produtos_atualizados": produtos_salvos,
+    }
+
+
+def listar_produtos_auditoria(
+    filial: str,
+    status: Optional[str] = None,
+    busca: Optional[str] = None,
+    limite: int = 100,
+    offset: int = 0,
+    apenas_ultima: bool = True,
+) -> List[Dict[str, Any]]:
+    if limite < 1 or limite > 10000:
+        raise HTTPException(status_code=400, detail="limite deve estar entre 1 e 10000.")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset não pode ser negativo.")
+
+    filial_normalizada = normalizar_filial(filial)
+    params: List[Tuple[str, str]] = [
+        ("select", "*"),
+        ("order", "data_auditoria.desc"),
+        ("limit", "10000" if apenas_ultima else str(limite)),
+        ("offset", "0" if apenas_ultima else str(offset)),
+    ]
+    if filial_normalizada != "all":
+        params.append(("filial", f"eq.{filial_normalizada}"))
+    if status:
+        status_normalizado = safe_str(status).lower()
+        if status_normalizado not in {"ok", "revisar", "sem_regra", "erro"}:
+            raise HTTPException(status_code=400, detail="status inválido.")
+        params.append(("status", f"eq.{status_normalizado}"))
+    if busca:
+        termo = montar_filtro_busca(busca)
+        if termo:
+            params.append(
+                (
+                    "or",
+                    f"(descricao.ilike.*{termo}*,sku.ilike.*{termo}*,codigo.ilike.*{termo}*,ncm.ilike.*{termo}*)",
+                )
+            )
+
+    dados = _supabase_request_tabela("GET", TABELA_AUDITORIA, params=params)
+    registros = dados if isinstance(dados, list) else []
+
+    if apenas_ultima:
+        vistos = set()
+        ultimos: List[Dict[str, Any]] = []
+        for registro in registros:
+            chave = registro.get("produto_id") or (
+                registro.get("filial"), registro.get("tiny_produto_id")
+            )
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            ultimos.append(registro)
+        return ultimos[offset: offset + limite]
+
+    return registros
+
+
+def obter_resumo_auditoria(filial: str) -> Dict[str, Any]:
+    registros = listar_produtos_auditoria(
+        filial=filial,
+        status=None,
+        busca=None,
+        limite=10000,
+        offset=0,
+        apenas_ultima=True,
+    )
+
+    contadores = {"ok": 0, "revisar": 0, "sem_regra": 0, "erro": 0}
+    confiancas: List[float] = []
+    ultima_auditoria: Optional[str] = None
+
+    for registro in registros:
+        status = safe_str(registro.get("status")).lower()
+        if status in contadores:
+            contadores[status] += 1
+        confianca = _valor_float_seguro(registro.get("percentual_confianca"))
+        if confianca > 0:
+            confiancas.append(confianca)
+        data_auditoria = safe_str(registro.get("data_auditoria"))
+        if data_auditoria and (ultima_auditoria is None or data_auditoria > ultima_auditoria):
+            ultima_auditoria = data_auditoria
+
+    return {
+        "status": "ok",
+        "filial": normalizar_filial(filial),
+        "total_produtos_auditados": len(registros),
+        "produtos_corretos": contadores["ok"],
+        "produtos_revisao": contadores["revisar"],
+        "produtos_sem_regra": contadores["sem_regra"],
+        "produtos_com_erro": contadores["erro"],
+        "confiabilidade_media": (
+            round(sum(confiancas) / len(confiancas), 2) if confiancas else 0.0
+        ),
+        "ultima_auditoria": ultima_auditoria,
     }
