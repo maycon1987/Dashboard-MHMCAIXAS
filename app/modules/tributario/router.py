@@ -199,3 +199,68 @@ def excluir_regra(
 ):
     _ = usuario
     return service.excluir_regra(regra_id)
+
+
+# ============================================================
+# AUDITORIA TRIBUTÁRIA
+# ============================================================
+
+@router.post("/auditar")
+def auditar_tributacao(
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    regime_tributario: str = Query("lucro_presumido"),
+    uf_origem: Optional[str] = Query(None, min_length=2, max_length=2),
+    uf_destino: Optional[str] = Query(None, min_length=2, max_length=2),
+    tipo_operacao: str = Query("venda"),
+    finalidade: str = Query("revenda"),
+    consumidor_final: bool = Query(False),
+    contribuinte_icms: bool = Query(True),
+    data_referencia: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    limite: int = Query(10000, ge=1, le=10000),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    filial_resolvida = service.resolver_filial_autorizada(
+        filial, usuario, permitir_all=False
+    )
+    return service.auditar_tributacao(
+        filial=filial_resolvida,
+        regime_tributario=regime_tributario,
+        uf_origem=uf_origem,
+        uf_destino=uf_destino,
+        tipo_operacao=tipo_operacao,
+        finalidade=finalidade,
+        consumidor_final=consumidor_final,
+        contribuinte_icms=contribuinte_icms,
+        data_referencia=data_referencia,
+        limite=limite,
+    )
+
+
+@router.get("/auditoria/resumo")
+def resumo_auditoria(
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    filial_resolvida = service.resolver_filial_autorizada(filial, usuario)
+    return service.obter_resumo_auditoria(filial_resolvida)
+
+
+@router.get("/auditoria/produtos")
+def produtos_auditoria(
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    status: Optional[str] = Query(None, description="ok, revisar, sem_regra ou erro"),
+    busca: Optional[str] = Query(None),
+    limite: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    apenas_ultima: bool = Query(True),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    filial_resolvida = service.resolver_filial_autorizada(filial, usuario)
+    return service.listar_produtos_auditoria(
+        filial=filial_resolvida,
+        status=status,
+        busca=busca,
+        limite=limite,
+        offset=offset,
+        apenas_ultima=apenas_ultima,
+    )
