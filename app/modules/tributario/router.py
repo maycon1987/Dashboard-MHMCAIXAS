@@ -1,6 +1,6 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 
 from . import service
 from .schemas import (
@@ -40,6 +40,52 @@ def sync_produtos(
         detalhar=detalhar,
         limite_detalhes=limite_detalhes,
         max_paginas=max_paginas,
+    )
+
+
+@router.post("/importar-produtos-tiny")
+async def importar_produtos_tiny(
+    arquivos: List[UploadFile] = File(
+        ...,
+        description="Uma ou mais planilhas .xls, .xlsx ou .csv exportadas do Tiny.",
+    ),
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    importar_precos: bool = Query(
+        False,
+        description="Quando true, também atualiza preço de venda e custo.",
+    ),
+    atualizar_descricao: bool = Query(
+        False,
+        description="Quando true, também atualiza a descrição do produto.",
+    ),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    filial_resolvida = service.resolver_filial_autorizada(
+        filial,
+        usuario,
+        permitir_all=False,
+    )
+
+    arquivos_lidos = []
+    tamanho_total = 0
+    limite_total_bytes = 100 * 1024 * 1024
+
+    for arquivo in arquivos:
+        nome = arquivo.filename or "arquivo_sem_nome"
+        conteudo = await arquivo.read()
+        tamanho_total += len(conteudo)
+        if tamanho_total > limite_total_bytes:
+            raise service.HTTPException(
+                status_code=413,
+                detail="O total dos arquivos não pode ultrapassar 100 MB.",
+            )
+        arquivos_lidos.append((nome, conteudo))
+
+    return service.importar_produtos_tiny(
+        filial=filial_resolvida,
+        arquivos=arquivos_lidos,
+        importar_precos=importar_precos,
+        atualizar_descricao=atualizar_descricao,
     )
 
 
