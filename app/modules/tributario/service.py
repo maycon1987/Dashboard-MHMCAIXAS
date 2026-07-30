@@ -1053,6 +1053,359 @@ def sincronizar_produtos(
 
 
 # ============================================================
+# ENRIQUECIMENTO INCREMENTAL DOS PRODUTOS
+# ============================================================
+
+def _texto_erro_tiny(exc: Exception) -> str:
+    """Transforma erros do Tiny em texto para identificação de bloqueio."""
+    if isinstance(exc, HTTPException):
+        return safe_str(exc.detail).lower()
+    return safe_str(exc).lower()
+
+
+def _tiny_bloqueado(texto_erro: str) -> bool:
+    """Identifica as mensagens mais comuns de limite de acesso do Tiny."""
+    texto = safe_str(texto_erro).lower()
+    return any(
+        trecho in texto
+        for trecho in (
+            "api bloqueada",
+            "excedido o número de acessos",
+            "excedido o numero de acessos",
+            "número de acessos a api",
+            "numero de acessos a api",
+        )
+    )
+
+
+def _atualizar_produto_enriquecido(
+    produto_id: str,
+    filial: str,
+    dados: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Atualiza um produto enriquecido por ID e filial.
+
+    Diferente do PATCH manual, esta função pode atualizar também
+    ultima_sincronizacao, pois esse campo faz parte do processo automático.
+    """
+    produto_id_normalizado = safe_str(produto_id)
+    filial_normalizada = normalizar_filial(filial)
+
+    if not produto_id_normalizado:
+        raise HTTPException(
+            status_code=400,
+            detail="produto_id não informado para o enriquecimento.",
+        )
+
+    payload = limpar_payload_banco(dados)
+    payload["updated_at"] = agora_iso()
+
+    response = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/{TABELA_PRODUTOS}",
+        headers=supabase_headers("return=representation"),
+        params={
+            "id": f"eq.{produto_id_normalizado}",
+            "filial": f"eq.{filial_normalizada}",
+        },
+        json=payload,
+        timeout=90,
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Erro ao atualizar produto enriquecido.",
+                "status_code": response.status_code,
+                "resposta": response.text,
+            },
+        )
+
+    try:
+        registros = response.json()
+    except ValueError:
+        registros = []
+
+    return registros if isinstance(registros, list) else []
+
+
+def _listar_produtos_pendentes_enriquecimento(
+    filial: str,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """
+    Lista produtos sem NCM que ainda podem ser consultados no Tiny.
+
+    Produtos já consultados e que realmente não possuem NCM no Tiny são
+    marcados como REVISAO_MANUAL e não entram novamente na próxima rodada.
+    """
+    filial_normalizada = normalizar_filial(filial)
+
+    registros = supabase_get_todos(
+        [
+            (
+                "select",
+                (
+                    "id,filial,tiny_produto_id,codigo,sku,descricao,ncm,cest,"
+                    "origem_mercadoria,unidade,preco,custo,fornecedor,ativo,"
+                    "status_ia,percentual_confianca,justificativa_ia,"
+                    "data_analise,lote,ultima_sincronizacao"
+                ),
+            ),
+            ("filial", f"eq.{filial_normalizada}"),
+            ("order", "ultima_sincronizacao.asc.nullsfirst,id.asc"),
+        ],
+        tamanho_pagina=1000,
+    )
+
+    sem_ncm = [
+        registro
+        for registro in registros
+        if not ncm_limpo(registro.get("ncm"))
+    ]
+
+    ja_consultados_sem_ncm = [
+        registro
+        for registro in sem_ncm
+        if safe_str(registro.get("status_ia")).upper() == "REVISAO_MANUAL"
+        and "tiny não informou ncm" in safe_str(
+            registro.get("justificativa_ia")
+        ).lower()
+    ]
+
+    pendentes = [
+        registro
+        for registro in sem_ncm
+        if registro not in ja_consultados_sem_ncm
+        and bool(safe_str(registro.get("tiny_produto_id")))
+    ]
+
+    return pendentes, len(sem_ncm), len(ja_consultados_sem_ncm)
+
+
+def enriquecer_produtos(
+    filial: str,
+    limite: int = 50,
+    intervalo_segundos: float = 0.7,
+) -> Dict[str, Any]:
+    """
+    Busca no Tiny os detalhes dos produtos ainda sem NCM.
+
+    O processo é incremental e seguro para a API:
+    - trabalha somente com sp ou mg;
+    - consulta no máximo o limite informado;
+    - espera entre as chamadas;
+    - interrompe imediatamente se o Tiny bloquear a API;
+    - não consulta novamente produtos que já foram verificados e continuam
+      sem NCM no cadastro do Tiny.
+    """
+    filial_normalizada = normalizar_filial(filial)
+
+    if filial_normalizada == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Use filial=sp ou filial=mg.",
+        )
+
+    if limite < 1 or limite > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="limite deve estar entre 1 e 200.",
+        )
+
+    if intervalo_segundos < 0.5 or intervalo_segundos > 10:
+        raise HTTPException(
+            status_code=400,
+            detail="intervalo_segundos deve estar entre 0.5 e 10.",
+        )
+
+    pendentes, total_sem_ncm_antes, ja_consultados_sem_ncm = (
+        _listar_produtos_pendentes_enriquecimento(filial_normalizada)
+    )
+    selecionados = pendentes[:limite]
+
+    if not selecionados:
+        return {
+            "status": "ok",
+            "filial": filial_normalizada,
+            "tiny_utilizado": (
+                "TINY_API_KEY_MINAS"
+                if filial_normalizada == "mg"
+                else "TINY_TOKEN"
+            ),
+            "total_sem_ncm_antes": total_sem_ncm_antes,
+            "pendentes_para_consulta_antes": len(pendentes),
+            "ja_consultados_sem_ncm": ja_consultados_sem_ncm,
+            "produtos_selecionados": 0,
+            "produtos_consultados": 0,
+            "produtos_atualizados": 0,
+            "produtos_com_ncm_encontrado": 0,
+            "produtos_sem_ncm_no_tiny": 0,
+            "erros_quantidade": 0,
+            "erros_amostra": [],
+            "api_tiny_bloqueada": False,
+            "total_sem_ncm_depois": total_sem_ncm_antes,
+            "pendentes_para_consulta_depois": len(pendentes),
+            "concluido": len(pendentes) == 0,
+            "mensagem": "Nenhum produto pendente para consultar no Tiny.",
+        }
+
+    consultados = 0
+    atualizados = 0
+    com_ncm_encontrado = 0
+    sem_ncm_no_tiny = 0
+    api_bloqueada = False
+    erros: List[Dict[str, Any]] = []
+
+    for indice, produto_banco in enumerate(selecionados):
+        produto_id = safe_str(produto_banco.get("id"))
+        tiny_produto_id = safe_str(produto_banco.get("tiny_produto_id"))
+
+        if not produto_id or not tiny_produto_id:
+            erros.append(
+                {
+                    "produto_id": produto_id or None,
+                    "tiny_produto_id": tiny_produto_id or None,
+                    "descricao": produto_banco.get("descricao"),
+                    "erro": "Produto sem ID interno ou tiny_produto_id.",
+                }
+            )
+            continue
+
+        try:
+            detalhe = obter_produto_tiny(
+                tiny_produto_id,
+                filial_normalizada,
+            )
+            consultados += 1
+
+            if not detalhe:
+                erros.append(
+                    {
+                        "produto_id": produto_id,
+                        "tiny_produto_id": tiny_produto_id,
+                        "descricao": produto_banco.get("descricao"),
+                        "erro": "Tiny não retornou detalhes do produto.",
+                    }
+                )
+            else:
+                normalizado = normalizar_produto(
+                    produto_pesquisa=produto_banco,
+                    filial=filial_normalizada,
+                    lote=int(produto_banco.get("lote") or 1),
+                    produto_detalhado=detalhe,
+                )
+
+                ncm_encontrado = ncm_limpo(normalizado.get("ncm"))
+                agora = agora_iso()
+
+                if len(ncm_encontrado) == 8:
+                    normalizado["ncm"] = ncm_encontrado
+                    normalizado["status_ia"] = "PENDENTE"
+                    normalizado["percentual_confianca"] = None
+                    normalizado["justificativa_ia"] = None
+                    normalizado["data_analise"] = None
+                    com_ncm_encontrado += 1
+                else:
+                    normalizado["ncm"] = None
+                    normalizado["status_ia"] = "REVISAO_MANUAL"
+                    normalizado["percentual_confianca"] = 0
+                    normalizado["justificativa_ia"] = (
+                        "Tiny não informou NCM no detalhe do produto; "
+                        "necessária revisão manual do cadastro."
+                    )
+                    normalizado["data_analise"] = agora
+                    sem_ncm_no_tiny += 1
+
+                normalizado["ultima_sincronizacao"] = agora
+                normalizado["updated_at"] = agora
+
+                registros_atualizados = _atualizar_produto_enriquecido(
+                    produto_id=produto_id,
+                    filial=filial_normalizada,
+                    dados=normalizado,
+                )
+                atualizados += (
+                    len(registros_atualizados)
+                    if registros_atualizados
+                    else 1
+                )
+
+        except HTTPException as exc:
+            texto_erro = _texto_erro_tiny(exc)
+            erros.append(
+                {
+                    "produto_id": produto_id,
+                    "tiny_produto_id": tiny_produto_id,
+                    "descricao": produto_banco.get("descricao"),
+                    "erro": safe_str(exc.detail)[:500],
+                }
+            )
+
+            if _tiny_bloqueado(texto_erro):
+                api_bloqueada = True
+                break
+
+        except Exception as exc:
+            texto_erro = _texto_erro_tiny(exc)
+            erros.append(
+                {
+                    "produto_id": produto_id,
+                    "tiny_produto_id": tiny_produto_id,
+                    "descricao": produto_banco.get("descricao"),
+                    "erro": safe_str(exc)[:500],
+                }
+            )
+
+            if _tiny_bloqueado(texto_erro):
+                api_bloqueada = True
+                break
+
+        if indice < len(selecionados) - 1:
+            time.sleep(intervalo_segundos)
+
+    pendentes_depois, total_sem_ncm_depois, ja_consultados_depois = (
+        _listar_produtos_pendentes_enriquecimento(filial_normalizada)
+    )
+
+    status_execucao = "ok"
+    if api_bloqueada:
+        status_execucao = "bloqueado"
+    elif erros:
+        status_execucao = "parcial"
+
+    return {
+        "status": status_execucao,
+        "filial": filial_normalizada,
+        "tiny_utilizado": (
+            "TINY_API_KEY_MINAS"
+            if filial_normalizada == "mg"
+            else "TINY_TOKEN"
+        ),
+        "total_sem_ncm_antes": total_sem_ncm_antes,
+        "pendentes_para_consulta_antes": len(pendentes),
+        "ja_consultados_sem_ncm_antes": ja_consultados_sem_ncm,
+        "produtos_selecionados": len(selecionados),
+        "produtos_consultados": consultados,
+        "produtos_atualizados": atualizados,
+        "produtos_com_ncm_encontrado": com_ncm_encontrado,
+        "produtos_sem_ncm_no_tiny": sem_ncm_no_tiny,
+        "erros_quantidade": len(erros),
+        "erros_amostra": erros[:10],
+        "api_tiny_bloqueada": api_bloqueada,
+        "total_sem_ncm_depois": total_sem_ncm_depois,
+        "pendentes_para_consulta_depois": len(pendentes_depois),
+        "ja_consultados_sem_ncm_depois": ja_consultados_depois,
+        "concluido": len(pendentes_depois) == 0,
+        "observacao": (
+            "Execute novamente para continuar pelos próximos produtos. "
+            "Produtos já consultados e sem NCM no Tiny ficam marcados para "
+            "revisão manual e não são consultados novamente."
+        ),
+    }
+
+
+# ============================================================
 # CONSULTAS
 # ============================================================
 
