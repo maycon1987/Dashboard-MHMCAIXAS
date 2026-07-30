@@ -43,6 +43,35 @@ def sync_produtos(
     )
 
 
+@router.post("/enriquecer-produtos")
+def enriquecer_produtos(
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    limite: int = Query(
+        50,
+        ge=1,
+        le=200,
+        description="Quantidade máxima de produtos consultados por execução.",
+    ),
+    intervalo_segundos: float = Query(
+        0.7,
+        ge=0.5,
+        le=10,
+        description="Intervalo entre as consultas de detalhe ao Tiny.",
+    ),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    filial_resolvida = service.resolver_filial_autorizada(
+        filial,
+        usuario,
+        permitir_all=False,
+    )
+    return service.enriquecer_produtos(
+        filial=filial_resolvida,
+        limite=limite,
+        intervalo_segundos=intervalo_segundos,
+    )
+
+
 @router.get("/resumo")
 def resumo(
     filial: Optional[str] = Query(None, description="sp, mg ou all"),
