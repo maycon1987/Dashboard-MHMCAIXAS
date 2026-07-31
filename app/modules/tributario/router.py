@@ -46,11 +46,15 @@ def sync_produtos(
 @router.post(
     "/importar-produtos-tiny",
     summary="Importar produtos por planilha do Tiny",
+    description=(
+        "Importa uma planilha XLS, XLSX ou CSV por execução. "
+        "O envio unitário evita a incompatibilidade do Swagger UI com arrays de arquivos binários."
+    ),
 )
 async def importar_produtos_tiny(
-    arquivos: List[UploadFile] = File(
+    arquivo: UploadFile = File(
         ...,
-        description="Uma ou mais planilhas exportadas do Tiny nos formatos XLS, XLSX ou CSV.",
+        description="Planilha exportada do Tiny nos formatos XLS, XLSX ou CSV.",
     ),
     filial: Optional[str] = Query(None, description="sp ou mg"),
     importar_precos: bool = Query(
@@ -69,16 +73,14 @@ async def importar_produtos_tiny(
         permitir_all=False,
     )
 
-    arquivos_lidos = []
-    for arquivo in arquivos:
-        conteudo = await arquivo.read()
-        arquivos_lidos.append(
-            {
-                "nome": arquivo.filename or "arquivo_sem_nome",
-                "content_type": arquivo.content_type,
-                "conteudo": conteudo,
-            }
-        )
+    conteudo = await arquivo.read()
+    arquivos_lidos = [
+        {
+            "nome": arquivo.filename or "arquivo_sem_nome",
+            "content_type": arquivo.content_type,
+            "conteudo": conteudo,
+        }
+    ]
 
     return service.importar_produtos_planilhas_tiny(
         filial=filial_resolvida,
