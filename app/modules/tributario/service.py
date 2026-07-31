@@ -1,5 +1,9 @@
+import csv
+import io
 import os
+import re
 import time
+import unicodedata
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -50,6 +54,7 @@ COLUNAS_PRODUTOS_TRIBUTARIOS = {
     "preco",
     "custo",
     "fornecedor",
+    "gtin",
     "ativo",
     "ultima_sincronizacao",
     "created_at",
@@ -74,6 +79,7 @@ COLUNAS_EDITAVEIS = {
     "preco",
     "custo",
     "fornecedor",
+    "gtin",
     "ativo",
     "status_ia",
     "percentual_confianca",
@@ -1049,6 +1055,337 @@ def sincronizar_produtos(
             "produtos_tributarios. O status_tributario é calculado "
             "virtualmente nas respostas e não é gravado no banco."
         ),
+    }
+
+
+# ============================================================
+# IMPORTAÇÃO DE PLANILHAS DO TINY
+# ============================================================
+
+_CABECALHOS_IMPORTADOR = {
+    "tiny_produto_id": {
+        "id", "id produto", "id do produto", "idproduto", "codigo tiny",
+        "codigo do tiny", "id tiny", "produto id", "tiny id",
+    },
+    "codigo": {
+        "codigo", "codigo produto", "codigo do produto", "cod produto",
+        "cod", "referencia", "ref",
+    },
+    "sku": {"sku", "codigo sku", "cod sku"},
+    "descricao": {
+        "descricao", "descricao produto", "descricao do produto", "produto",
+        "nome", "nome produto", "nome do produto",
+    },
+    "ncm": {"ncm", "codigo ncm", "classificacao fiscal"},
+    "cest": {"cest", "codigo cest"},
+    "fornecedor": {
+        "fornecedor", "nome fornecedor", "fornecedor principal",
+    },
+    "gtin": {
+        "gtin", "ean", "gtin ean", "codigo de barras", "codigo barras",
+        "codigo de barra", "cod barras",
+    },
+    "unidade": {"unidade", "un", "unidade medida", "unidade de medida"},
+    "origem_mercadoria": {
+        "origem", "origem mercadoria", "origem da mercadoria",
+    },
+    "preco": {
+        "preco", "preco venda", "preco de venda", "valor venda",
+        "valor de venda",
+    },
+    "custo": {
+        "custo", "preco custo", "preco de custo", "valor custo",
+        "valor de custo", "preco medio custo",
+    },
+}
+
+
+def _normalizar_cabecalho(valor: Any) -> str:
+    texto = safe_str(valor).lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = re.sub(r"[^a-z0-9]+", " ", texto)
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def _campo_por_cabecalho(cabecalho: Any) -> Optional[str]:
+    normalizado = _normalizar_cabecalho(cabecalho)
+    for campo, aliases in _CABECALHOS_IMPORTADOR.items():
+        if normalizado in aliases:
+            return campo
+    return None
+
+
+def _normalizar_identificador(valor: Any) -> str:
+    texto = safe_str(valor)
+    if texto.endswith(".0") and texto[:-2].isdigit():
+        texto = texto[:-2]
+    return texto.strip()
+
+
+def _normalizar_gtin(valor: Any) -> Optional[str]:
+    texto = _normalizar_identificador(valor)
+    digitos = "".join(c for c in texto if c.isdigit())
+    return digitos or None
+
+
+def _normalizar_cest(valor: Any) -> Optional[str]:
+    digitos = "".join(c for c in safe_str(valor) if c.isdigit())
+    return digitos or None
+
+
+def _valor_nao_vazio(valor: Any) -> bool:
+    if valor is None:
+        return False
+    if isinstance(valor, str):
+        return bool(valor.strip())
+    return True
+
+
+def _detectar_delimitador(texto: str) -> str:
+    amostra = texto[:8192]
+    try:
+        return csv.Sniffer().sniff(amostra, delimiters=";,\t|").delimiter
+    except csv.Error:
+        return ";" if amostra.count(";") >= amostra.count(",") else ","
+
+
+def _ler_csv_bytes(conteudo: bytes) -> List[List[Any]]:
+    texto = None
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            texto = conteudo.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if texto is None:
+        raise ValueError("Não foi possível identificar a codificação do CSV.")
+    delimitador = _detectar_delimitador(texto)
+    return [list(linha) for linha in csv.reader(io.StringIO(texto), delimiter=delimitador)]
+
+
+def _ler_xlsx_bytes(conteudo: bytes) -> List[List[Any]]:
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise ValueError("A dependência openpyxl não está instalada.") from exc
+    workbook = load_workbook(io.BytesIO(conteudo), read_only=True, data_only=True)
+    planilha = workbook.active
+    linhas = [list(linha) for linha in planilha.iter_rows(values_only=True)]
+    workbook.close()
+    return linhas
+
+
+def _ler_xls_bytes(conteudo: bytes) -> List[List[Any]]:
+    try:
+        import xlrd
+    except ImportError as exc:
+        raise ValueError("A dependência xlrd não está instalada.") from exc
+    workbook = xlrd.open_workbook(file_contents=conteudo)
+    planilha = workbook.sheet_by_index(0)
+    return [planilha.row_values(indice) for indice in range(planilha.nrows)]
+
+
+def _ler_planilha(nome: str, conteudo: bytes) -> List[List[Any]]:
+    extensao = os.path.splitext(nome.lower())[1]
+    if extensao == ".csv":
+        return _ler_csv_bytes(conteudo)
+    if extensao == ".xlsx":
+        return _ler_xlsx_bytes(conteudo)
+    if extensao == ".xls":
+        return _ler_xls_bytes(conteudo)
+    raise ValueError("Formato não suportado. Envie arquivo XLS, XLSX ou CSV.")
+
+
+def _localizar_linha_cabecalho(linhas: List[List[Any]]) -> Tuple[int, Dict[int, str]]:
+    melhor_indice = -1
+    melhor_mapa: Dict[int, str] = {}
+    for indice, linha in enumerate(linhas[:30]):
+        mapa: Dict[int, str] = {}
+        for coluna, valor in enumerate(linha):
+            campo = _campo_por_cabecalho(valor)
+            if campo and campo not in mapa.values():
+                mapa[coluna] = campo
+        if len(mapa) > len(melhor_mapa):
+            melhor_indice = indice
+            melhor_mapa = mapa
+    identificadores = {"tiny_produto_id", "codigo", "sku"}
+    if melhor_indice < 0 or not identificadores.intersection(melhor_mapa.values()):
+        raise ValueError(
+            "Cabeçalho não reconhecido. A planilha precisa ter ID do Tiny, Código ou SKU."
+        )
+    return melhor_indice, melhor_mapa
+
+
+def _extrair_registros_planilha(nome: str, conteudo: bytes) -> Tuple[List[Dict[str, Any]], int]:
+    linhas = _ler_planilha(nome, conteudo)
+    if not linhas:
+        return [], 0
+    indice_cabecalho, mapa = _localizar_linha_cabecalho(linhas)
+    registros: List[Dict[str, Any]] = []
+    invalidos = 0
+    for numero_linha, linha in enumerate(linhas[indice_cabecalho + 1:], start=indice_cabecalho + 2):
+        registro: Dict[str, Any] = {"_arquivo": nome, "_linha": numero_linha}
+        for indice_coluna, campo in mapa.items():
+            valor = linha[indice_coluna] if indice_coluna < len(linha) else None
+            if _valor_nao_vazio(valor):
+                registro[campo] = valor
+        if not any(_valor_nao_vazio(registro.get(c)) for c in ("tiny_produto_id", "codigo", "sku")):
+            if any(_valor_nao_vazio(v) for k, v in registro.items() if not k.startswith("_")):
+                invalidos += 1
+            continue
+        registros.append(registro)
+    return registros, invalidos
+
+
+def _chave_indice(valor: Any) -> str:
+    return _normalizar_identificador(valor).casefold()
+
+
+def importar_produtos_planilhas_tiny(
+    filial: str,
+    arquivos: List[Dict[str, Any]],
+    importar_precos: bool = False,
+    atualizar_descricao: bool = False,
+) -> Dict[str, Any]:
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada == "all":
+        raise HTTPException(status_code=400, detail="Use filial=sp ou filial=mg.")
+    if not arquivos:
+        raise HTTPException(status_code=400, detail="Envie pelo menos uma planilha.")
+
+    registros_planilha: List[Dict[str, Any]] = []
+    arquivos_processados: List[Dict[str, Any]] = []
+    invalidos = 0
+    erros_arquivos: List[Dict[str, str]] = []
+
+    for arquivo in arquivos:
+        nome = safe_str(arquivo.get("nome")) or "arquivo_sem_nome"
+        conteudo = arquivo.get("conteudo") or b""
+        if not conteudo:
+            erros_arquivos.append({"arquivo": nome, "erro": "Arquivo vazio."})
+            continue
+        try:
+            extraidos, invalidos_arquivo = _extrair_registros_planilha(nome, conteudo)
+            registros_planilha.extend(extraidos)
+            invalidos += invalidos_arquivo
+            arquivos_processados.append({"arquivo": nome, "linhas_validas": len(extraidos)})
+        except Exception as exc:
+            erros_arquivos.append({"arquivo": nome, "erro": safe_str(exc)})
+
+    if not registros_planilha:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "erro": "Nenhuma linha válida foi encontrada nas planilhas.",
+                "arquivos_com_erro": erros_arquivos,
+            },
+        )
+
+    produtos = supabase_get_todos([
+        ("select", "*"),
+        ("filial", f"eq.{filial_normalizada}"),
+        ("order", "id.asc"),
+    ])
+
+    por_tiny = {_chave_indice(p.get("tiny_produto_id")): p for p in produtos if _chave_indice(p.get("tiny_produto_id"))}
+    por_sku = {_chave_indice(p.get("sku")): p for p in produtos if _chave_indice(p.get("sku"))}
+    por_codigo = {_chave_indice(p.get("codigo")): p for p in produtos if _chave_indice(p.get("codigo"))}
+
+    atualizacoes_por_id: Dict[str, Dict[str, Any]] = {}
+    linhas_por_id: Dict[str, int] = {}
+    nao_encontrados: List[Dict[str, Any]] = []
+    duplicados = 0
+
+    for linha in registros_planilha:
+        produto = None
+        tiny_id = _chave_indice(linha.get("tiny_produto_id"))
+        sku = _chave_indice(linha.get("sku"))
+        codigo = _chave_indice(linha.get("codigo"))
+        if tiny_id:
+            produto = por_tiny.get(tiny_id)
+        if produto is None and sku:
+            produto = por_sku.get(sku)
+        if produto is None and codigo:
+            produto = por_codigo.get(codigo)
+        if produto is None:
+            nao_encontrados.append({
+                "arquivo": linha.get("_arquivo"),
+                "linha": linha.get("_linha"),
+                "tiny_produto_id": _normalizar_identificador(linha.get("tiny_produto_id")),
+                "sku": _normalizar_identificador(linha.get("sku")),
+                "codigo": _normalizar_identificador(linha.get("codigo")),
+                "descricao": safe_str(linha.get("descricao")),
+            })
+            continue
+
+        produto_id = safe_str(produto.get("id"))
+        if produto_id in atualizacoes_por_id:
+            duplicados += 1
+        payload = atualizacoes_por_id.setdefault(produto_id, dict(produto))
+        linhas_por_id[produto_id] = linhas_por_id.get(produto_id, 0) + 1
+
+        if _valor_nao_vazio(linha.get("ncm")):
+            ncm = ncm_limpo(linha.get("ncm"))
+            if len(ncm) == 8:
+                payload["ncm"] = ncm
+                payload["status_ia"] = status_ia_inicial(ncm)
+        if _valor_nao_vazio(linha.get("cest")):
+            payload["cest"] = _normalizar_cest(linha.get("cest"))
+        if _valor_nao_vazio(linha.get("fornecedor")):
+            payload["fornecedor"] = safe_str(linha.get("fornecedor"))
+        if _valor_nao_vazio(linha.get("gtin")):
+            payload["gtin"] = _normalizar_gtin(linha.get("gtin"))
+        if _valor_nao_vazio(linha.get("unidade")):
+            payload["unidade"] = safe_str(linha.get("unidade")).upper()
+        if _valor_nao_vazio(linha.get("origem_mercadoria")):
+            payload["origem_mercadoria"] = _normalizar_identificador(linha.get("origem_mercadoria"))
+        if atualizar_descricao and _valor_nao_vazio(linha.get("descricao")):
+            payload["descricao"] = safe_str(linha.get("descricao"))
+        if importar_precos:
+            if _valor_nao_vazio(linha.get("preco")):
+                payload["preco"] = dinheiro_para_float(linha.get("preco"))
+            if _valor_nao_vazio(linha.get("custo")):
+                payload["custo"] = dinheiro_para_float(linha.get("custo"))
+        payload["updated_at"] = agora_iso()
+        payload["ultima_sincronizacao"] = agora_iso()
+
+    atualizacoes = list(atualizacoes_por_id.values())
+    atualizados = 0
+    if atualizacoes:
+        try:
+            for inicio in range(0, len(atualizacoes), 200):
+                bloco = atualizacoes[inicio:inicio + 200]
+                salvos = supabase_upsert(bloco)
+                atualizados += len(salvos) if salvos else len(bloco)
+        except HTTPException as exc:
+            detalhe = exc.detail
+            if "gtin" in safe_str(detalhe).lower():
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "erro": "A coluna gtin ainda não existe em produtos_tributarios.",
+                        "acao": "Execute o SQL 01_adicionar_gtin_produtos_tributarios.sql no Supabase e tente novamente.",
+                        "detalhe_original": detalhe,
+                    },
+                )
+            raise
+
+    return {
+        "status": "ok",
+        "filial": filial_normalizada,
+        "arquivos_recebidos": len(arquivos),
+        "arquivos_processados": arquivos_processados,
+        "arquivos_com_erro": erros_arquivos,
+        "linhas_lidas": len(registros_planilha) + invalidos,
+        "linhas_validas": len(registros_planilha),
+        "produtos_atualizados": atualizados,
+        "duplicados": duplicados,
+        "linhas_invalidas": invalidos,
+        "nao_encontrados": len(nao_encontrados),
+        "nao_encontrados_amostra": nao_encontrados[:100],
+        "importou_precos": importar_precos,
+        "atualizou_descricao": atualizar_descricao,
     }
 
 
@@ -2513,4 +2850,3 @@ def listar_ncms_utilizados(
         "produtos_com_ncm_invalido": produtos_ncm_invalido,
         "ncms": lista,
     }
-
