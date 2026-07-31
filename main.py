@@ -25,7 +25,7 @@ from app.modules.tributario.router import router as tributario_router
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.6.0",
+    version="2.6.1",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
