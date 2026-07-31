@@ -1,6 +1,6 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 
 from . import service
 from .schemas import (
@@ -40,6 +40,51 @@ def sync_produtos(
         detalhar=detalhar,
         limite_detalhes=limite_detalhes,
         max_paginas=max_paginas,
+    )
+
+
+@router.post(
+    "/importar-produtos-tiny",
+    summary="Importar produtos por planilha do Tiny",
+)
+async def importar_produtos_tiny(
+    arquivos: List[UploadFile] = File(
+        ...,
+        description="Uma ou mais planilhas exportadas do Tiny nos formatos XLS, XLSX ou CSV.",
+    ),
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    importar_precos: bool = Query(
+        False,
+        description="Quando verdadeiro, também atualiza preço de venda e custo.",
+    ),
+    atualizar_descricao: bool = Query(
+        False,
+        description="Quando verdadeiro, também atualiza a descrição do produto.",
+    ),
+    usuario: Dict[str, Any] = Depends(service.obter_usuario_atual),
+):
+    filial_resolvida = service.resolver_filial_autorizada(
+        filial,
+        usuario,
+        permitir_all=False,
+    )
+
+    arquivos_lidos = []
+    for arquivo in arquivos:
+        conteudo = await arquivo.read()
+        arquivos_lidos.append(
+            {
+                "nome": arquivo.filename or "arquivo_sem_nome",
+                "content_type": arquivo.content_type,
+                "conteudo": conteudo,
+            }
+        )
+
+    return service.importar_produtos_planilhas_tiny(
+        filial=filial_resolvida,
+        arquivos=arquivos_lidos,
+        importar_precos=importar_precos,
+        atualizar_descricao=atualizar_descricao,
     )
 
 
