@@ -1,13 +1,23 @@
 import os
 import time
+import io
+import re
+import json
+import html
+import zipfile
 import requests
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from calendar import monthrange
 from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+
+from app.modules.tributario.router import router as tributario_router
+from app.integracao_lumino import router as noticias_router
 
 
 # ============================================================
@@ -16,7 +26,7 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="MHM Dashboard Tiny API",
-    version="2.0.1",
+    version="2.6.3",
     description="API para sincronizar Tiny/Olist com Supabase e alimentar dashboard Lovable."
 )
 
@@ -28,12 +38,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(tributario_router)
+app.include_router(noticias_router)
 
 # ============================================================
 # ENV
 # ============================================================
 
 TINY_TOKEN = os.getenv("TINY_TOKEN", "").strip()
+TINY_API_KEY_MINAS = os.getenv("TINY_API_KEY_MINAS", "").strip()
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 
 # Aceita os dois nomes, para não quebrar se o Railway tiver uma ou outra variável
@@ -44,6 +58,12 @@ SUPABASE_SERVICE_ROLE_KEY = (
 
 TINY_BASE_URL = "https://api.tiny.com.br/api2"
 
+# Ativação gradual da proteção JWT.
+# Primeiro publique com false, ajuste o Lovable para enviar o token,
+# teste e só depois altere para true no Railway.
+JWT_AUTH_ENABLED = os.getenv("JWT_AUTH_ENABLED", "false").strip().lower() in [
+    "1", "true", "yes", "sim", "on"
+]
 
 # ============================================================
 # HELPERS GERAIS
@@ -341,17 +361,243 @@ def buscar_configuracao(chave: str) -> Optional[str]:
     return resultado[0].get("valor")
 
 
+def normalizar_filial(filial: str = "sp") -> str:
+    """
+    Padroniza filial para uso no backend.
+    sp  = Campinas
+    mg  = Minas/Pouso Alegre
+    all = consolidado
+    """
+    filial = (filial or "sp").lower().strip()
+
+    if filial in ["all", "todas", "todos", "consolidado"]:
+        return "all"
+
+    if filial in ["mg", "minas", "pouso_alegre", "pouso-alegre"]:
+        return "mg"
+
+    return "sp"
+
+
+def adicionar_filtro_filial_params(params: List[Any], filial: str = "sp") -> List[Any]:
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params.append(("filial", f"eq.{filial_normalizada}"))
+    return params
+
+
+
+# ============================================================
+# AUTENTICAÇÃO E AUTORIZAÇÃO — SUPABASE JWT
+# ============================================================
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def validar_token_supabase(access_token: str) -> Dict[str, Any]:
+    """
+    Valida o access_token diretamente no Supabase Auth.
+
+    Essa abordagem funciona tanto para projetos com assinatura JWT legada
+    quanto para projetos com chaves assimétricas, sem expor o JWT Secret.
+    """
+    validar_env()
+
+    url = f"{SUPABASE_URL}/auth/v1/user"
+
+    response = requests.get(
+        url,
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        timeout=30
+    )
+
+    if response.status_code in [401, 403]:
+        raise HTTPException(
+            status_code=401,
+            detail="Sessão inválida ou expirada. Faça login novamente."
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "erro": "Não foi possível validar a sessão no Supabase Auth.",
+                "status_code": response.status_code,
+                "resposta": response.text
+            }
+        )
+
+    usuario_auth = response.json()
+
+    if not usuario_auth.get("id") or not usuario_auth.get("email"):
+        raise HTTPException(
+            status_code=401,
+            detail="Token válido, mas sem identificação de usuário."
+        )
+
+    return usuario_auth
+
+
+def buscar_perfil_dashboard(email: str) -> Dict[str, Any]:
+    """
+    Consulta a autorização interna do usuário na tabela usuarios_dashboard.
+    """
+    resultado = supabase_get(
+        "usuarios_dashboard",
+        {
+            "select": "email,nome,perfil,filial,ativo",
+            "email": f"eq.{email}",
+            "limit": "1"
+        }
+    )
+
+    if not resultado:
+        raise HTTPException(
+            status_code=403,
+            detail="Usuário autenticado, mas sem acesso ao Dashboard MHM."
+        )
+
+    perfil = resultado[0]
+
+    if perfil.get("ativo") is False:
+        raise HTTPException(
+            status_code=403,
+            detail="Usuário desativado no Dashboard MHM."
+        )
+
+    perfil["perfil"] = safe_str(perfil.get("perfil")).lower().strip()
+    perfil["filial"] = normalizar_filial(perfil.get("filial") or "sp")
+
+    return perfil
+
+
+def obter_usuario_atual(
+    credenciais: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)
+) -> Dict[str, Any]:
+    """
+    Dependência usada pelas rotas protegidas.
+
+    Durante a implantação, JWT_AUTH_ENABLED=false mantém compatibilidade
+    temporária. Quando true, o Bearer token passa a ser obrigatório.
+    """
+    if not JWT_AUTH_ENABLED:
+        return {
+            "id": "modo-implantacao",
+            "email": "sistema@interno",
+            "nome": "Modo de implantação",
+            "perfil": "admin",
+            "filial": "all",
+            "ativo": True,
+            "auth_desativada_temporariamente": True
+        }
+
+    if not credenciais or not credenciais.credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Token de acesso não informado.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    usuario_auth = validar_token_supabase(credenciais.credentials)
+    perfil = buscar_perfil_dashboard(usuario_auth["email"])
+
+    return {
+        "id": usuario_auth["id"],
+        "email": usuario_auth["email"],
+        "nome": perfil.get("nome") or usuario_auth.get("email"),
+        "perfil": perfil.get("perfil"),
+        "filial": perfil.get("filial"),
+        "ativo": perfil.get("ativo", True)
+    }
+
+
+def resolver_filial_autorizada(
+    filial_solicitada: Optional[str],
+    usuario: Dict[str, Any],
+    permitir_all: bool = True
+) -> str:
+    """
+    Decide a filial no backend.
+
+    - Usuário com filial=all pode escolher sp, mg ou all.
+    - Usuário restrito a sp/mg só pode consultar sua própria filial.
+    - Quando a filial não é enviada, usa a filial do próprio usuário.
+    """
+    filial_usuario = normalizar_filial(usuario.get("filial") or "sp")
+
+    if filial_solicitada is None or not safe_str(filial_solicitada).strip():
+        if filial_usuario == "all":
+            return "all" if permitir_all else "sp"
+        return filial_usuario
+
+    filial_pedida = normalizar_filial(filial_solicitada)
+
+    if not permitir_all and filial_pedida == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Esta operação não aceita filial=all."
+        )
+
+    if filial_usuario == "all":
+        return filial_pedida
+
+    if filial_pedida != filial_usuario:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Usuário sem permissão para acessar a filial '{filial_pedida}'."
+        )
+
+    return filial_usuario
+
+
+@app.get("/auth/me")
+def auth_me(
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    """
+    Retorna o usuário reconhecido pelo backend.
+    Útil para testar a integração JWT com o Lovable.
+    """
+    return {
+        "status": "ok",
+        "auth_ativa": JWT_AUTH_ENABLED,
+        "usuario": usuario
+    }
+
+
 # ============================================================
 # TINY
 # ============================================================
 
-def tiny_get(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def obter_token_tiny(filial: str = "sp") -> str:
+    """
+    Retorna o token Tiny conforme a filial.
+    """
+
+    filial = (filial or "sp").lower().strip()
+
+    if filial in ["mg", "minas", "pouso_alegre"]:
+        if not TINY_API_KEY_MINAS:
+            raise HTTPException(
+                status_code=500,
+                detail="TINY_API_KEY_MINAS não configurado."
+            )
+        return TINY_API_KEY_MINAS
+
+    return TINY_TOKEN
+
+
+def tiny_get(endpoint: str, params: Dict[str, Any], filial: str = "sp") -> Dict[str, Any]:
     validar_env()
 
     url = f"{TINY_BASE_URL}/{endpoint}"
 
     params_base = {
-        "token": TINY_TOKEN,
+        "token": obter_token_tiny(filial),
         "formato": "json",
     }
 
@@ -384,6 +630,36 @@ def tiny_get(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
     status = retorno.get("status")
     if status and str(status).upper() == "ERRO":
+        codigo_erro = safe_str(retorno.get("codigo_erro")).strip()
+        erros = retorno.get("erros") or []
+
+        mensagens_erro = []
+        for item in erros:
+            if isinstance(item, dict):
+                mensagens_erro.append(
+                    safe_str(item.get("erro") or item.get("mensagem") or "")
+                )
+            else:
+                mensagens_erro.append(safe_str(item))
+
+        texto_erros = " ".join(mensagens_erro).lower()
+
+        # O Tiny usa código 20 quando a pesquisa não encontra registros.
+        # Isso não é falha da sincronização: significa apenas dia/período sem vendas.
+        if codigo_erro == "20" or "não retornou registros" in texto_erros or "nao retornou registros" in texto_erros:
+            retorno_vazio = {
+                "status": "OK",
+                "status_processamento": retorno.get("status_processamento", "3"),
+                "numero_paginas": 1
+            }
+
+            if "pedidos.pesquisa.php" in endpoint:
+                retorno_vazio["pedidos"] = []
+            elif "produtos.pesquisa.php" in endpoint:
+                retorno_vazio["produtos"] = []
+
+            return {"retorno": retorno_vazio}
+
         raise HTTPException(
             status_code=500,
             detail={
@@ -395,31 +671,382 @@ def tiny_get(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
     return dados
 
 
+
+# ============================================================
+# TINY FISCAL — NOTAS E XML
+# ============================================================
+
+def tiny_post_xml(
+    endpoint: str,
+    params: Dict[str, Any],
+    filial: str = "sp",
+    tentativas: int = 4
+) -> str:
+    """
+    Executa um POST na API 2.0 do Tiny para endpoints que retornam XML.
+
+    O endpoint nota.fiscal.obter.xml.php não retorna JSON: ele devolve um
+    XML de resposta contendo xml_nfe e, quando existir, xml_cancelamento.
+    """
+    url = f"{TINY_BASE_URL}/{endpoint}"
+    payload = {
+        "token": obter_token_tiny(filial),
+        **params,
+    }
+
+    ultimo_erro = None
+
+    for tentativa in range(1, max(1, tentativas) + 1):
+        try:
+            response = requests.post(url, data=payload, timeout=120)
+        except requests.RequestException as exc:
+            ultimo_erro = str(exc)
+            if tentativa < tentativas:
+                time.sleep(min(2 ** tentativa, 10))
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "erro": "Falha de comunicação com o Tiny.",
+                    "endpoint": endpoint,
+                    "detalhe": ultimo_erro,
+                }
+            )
+
+        if response.status_code >= 400:
+            ultimo_erro = response.text
+            if tentativa < tentativas and response.status_code in [429, 500, 502, 503, 504]:
+                time.sleep(min(2 ** tentativa, 10))
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "erro": "Erro HTTP ao consultar o XML no Tiny.",
+                    "endpoint": endpoint,
+                    "status_code": response.status_code,
+                    "resposta": response.text[:2000],
+                }
+            )
+
+        conteudo = response.text or ""
+
+        # Códigos 6 e 11 indicam bloqueio temporário por excesso/concor­rência.
+        bloqueio_temporario = (
+            "<codigo_erro>6</codigo_erro>" in conteudo
+            or "<codigo_erro>11</codigo_erro>" in conteudo
+        )
+        if bloqueio_temporario and tentativa < tentativas:
+            time.sleep(min(2 ** tentativa, 12))
+            continue
+
+        return conteudo
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "erro": "Não foi possível consultar o Tiny após novas tentativas.",
+            "endpoint": endpoint,
+            "detalhe": ultimo_erro,
+        }
+    )
+
+
+def pesquisar_notas_fiscais_tiny(
+    data_inicial: date,
+    data_final: date,
+    pagina: int = 1,
+    filial: str = "sp"
+) -> Dict[str, Any]:
+    return tiny_get(
+        "notas.fiscais.pesquisa.php",
+        {
+            "tipoNota": "S",
+            "dataInicial": data_inicial.strftime("%d/%m/%Y"),
+            "dataFinal": data_final.strftime("%d/%m/%Y"),
+            "pagina": pagina,
+        },
+        filial=filial,
+    )
+
+
+def extrair_lista_notas_fiscais(resposta_tiny: Dict[str, Any]) -> List[Dict[str, Any]]:
+    retorno = resposta_tiny.get("retorno", {}) or {}
+    notas_raw = retorno.get("notas_fiscais", []) or []
+    notas: List[Dict[str, Any]] = []
+
+    for item in notas_raw:
+        if isinstance(item, dict):
+            nota = item.get("nota_fiscal", item)
+            if isinstance(nota, dict):
+                notas.append(nota)
+
+    return notas
+
+
+def buscar_notas_fiscais_periodo_tiny(
+    data_inicial: date,
+    data_final: date,
+    filial: str = "sp",
+    limite: int = 0,
+    pausa_segundos: float = 0.35
+) -> List[Dict[str, Any]]:
+    """
+    Pesquisa notas de saída, com paginação de até 100 registros por página.
+
+    limite=0 significa sem limite artificial. O limite é aplicado depois da
+    paginação e existe apenas para permitir downloads menores no frontend.
+    """
+    todas: List[Dict[str, Any]] = []
+    pagina = 1
+
+    while True:
+        resposta = pesquisar_notas_fiscais_tiny(
+            data_inicial,
+            data_final,
+            pagina=pagina,
+            filial=filial,
+        )
+        retorno = resposta.get("retorno", {}) or {}
+        notas = extrair_lista_notas_fiscais(resposta)
+        todas.extend(notas)
+
+        if limite > 0 and len(todas) >= limite:
+            return todas[:limite]
+
+        numero_paginas = int(retorno.get("numero_paginas", 1) or 1)
+        if pagina >= numero_paginas:
+            break
+
+        pagina += 1
+        time.sleep(pausa_segundos)
+
+    return todas
+
+
+def modelo_nota_pela_chave(chave_acesso: Any) -> str:
+    """
+    Na chave de acesso da NF-e/NFC-e, o modelo ocupa as posições 21 e 22.
+    Modelo 55 = NF-e; modelo 65 = NFC-e.
+    """
+    chave = re.sub(r"\D", "", safe_str(chave_acesso))
+    if len(chave) == 44:
+        modelo = chave[20:22]
+        if modelo == "55":
+            return "nfe"
+        if modelo == "65":
+            return "nfce"
+    return "outros"
+
+
+def nota_fiscal_valida_para_total(nota: Dict[str, Any]) -> bool:
+    descricao = normalizar_texto_tag(
+        safe_str(nota.get("descricao_situacao") or nota.get("situacao") or "")
+    )
+    termos_invalidos = [
+        "CANCEL", "REJEIT", "DENEG", "INUTIL", "NAO AUTORIZ",
+    ]
+    return not any(termo in descricao for termo in termos_invalidos)
+
+
+def resumir_notas_fiscais(notas: List[Dict[str, Any]]) -> Dict[str, Any]:
+    grupos = {
+        "nfe": {"quantidade": 0, "valor_total": 0.0},
+        "nfce": {"quantidade": 0, "valor_total": 0.0},
+        "outros": {"quantidade": 0, "valor_total": 0.0},
+    }
+    situacoes: Dict[str, Dict[str, Any]] = {}
+    documentos_invalidos = 0
+    valor_invalidos = 0.0
+
+    for nota in notas:
+        modelo = modelo_nota_pela_chave(nota.get("chave_acesso"))
+        valor = dinheiro_para_float(nota.get("valor"))
+        situacao = safe_str(
+            nota.get("descricao_situacao") or nota.get("situacao") or "Sem situação"
+        ).strip() or "Sem situação"
+
+        if situacao not in situacoes:
+            situacoes[situacao] = {"quantidade": 0, "valor_total": 0.0}
+        situacoes[situacao]["quantidade"] += 1
+        situacoes[situacao]["valor_total"] += valor
+
+        if nota_fiscal_valida_para_total(nota):
+            grupos[modelo]["quantidade"] += 1
+            grupos[modelo]["valor_total"] += valor
+        else:
+            documentos_invalidos += 1
+            valor_invalidos += valor
+
+    for grupo in grupos.values():
+        grupo["valor_total"] = round(grupo["valor_total"], 2)
+
+    situacoes_lista = []
+    for nome, dados in situacoes.items():
+        situacoes_lista.append({
+            "situacao": nome,
+            "quantidade": dados["quantidade"],
+            "valor_total": round(dados["valor_total"], 2),
+        })
+    situacoes_lista.sort(key=lambda item: item["valor_total"], reverse=True)
+
+    quantidade_total = sum(grupo["quantidade"] for grupo in grupos.values())
+    valor_total = round(sum(grupo["valor_total"] for grupo in grupos.values()), 2)
+
+    return {
+        **grupos,
+        "total_geral": {
+            "quantidade": quantidade_total,
+            "valor_total": valor_total,
+        },
+        "documentos_desconsiderados": {
+            "quantidade": documentos_invalidos,
+            "valor_total": round(valor_invalidos, 2),
+            "motivo": "Canceladas, rejeitadas, denegadas, inutilizadas ou não autorizadas.",
+        },
+        "situacoes": situacoes_lista,
+    }
+
+
+def _tag_local(elemento: ET.Element) -> str:
+    return elemento.tag.split("}")[-1] if "}" in elemento.tag else elemento.tag
+
+
+def extrair_xml_nfe_resposta_tiny(conteudo_resposta: str) -> Dict[str, Optional[str]]:
+    """
+    Extrai o XML fiscal e o XML de cancelamento do envelope retornado pelo Tiny.
+    Funciona tanto quando o XML vem como filho real quanto quando vem escapado.
+    """
+    if not conteudo_resposta.strip():
+        raise HTTPException(status_code=502, detail="Tiny retornou resposta vazia ao obter XML.")
+
+    try:
+        raiz = ET.fromstring(conteudo_resposta)
+    except ET.ParseError:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "erro": "Tiny retornou XML de resposta inválido.",
+                "resposta": conteudo_resposta[:2000],
+            }
+        )
+
+    status = ""
+    codigo_erro = ""
+    mensagens: List[str] = []
+    elemento_xml_nfe = None
+    elemento_xml_cancelamento = None
+
+    for elemento in raiz.iter():
+        nome = _tag_local(elemento)
+        if nome == "status":
+            status = safe_str(elemento.text).strip()
+        elif nome == "codigo_erro":
+            codigo_erro = safe_str(elemento.text).strip()
+        elif nome == "erro":
+            mensagem = safe_str(elemento.text).strip()
+            if mensagem:
+                mensagens.append(mensagem)
+        elif nome == "xml_nfe":
+            elemento_xml_nfe = elemento
+        elif nome == "xml_cancelamento":
+            elemento_xml_cancelamento = elemento
+
+    if status.upper() == "ERRO":
+        status_http = 404 if codigo_erro == "32" else 502
+        raise HTTPException(
+            status_code=status_http,
+            detail={
+                "erro": "Tiny não disponibilizou o XML solicitado.",
+                "codigo_erro": codigo_erro,
+                "mensagens": mensagens,
+            }
+        )
+
+    def conteudo_elemento(elemento: Optional[ET.Element]) -> Optional[str]:
+        if elemento is None:
+            return None
+
+        filhos = list(elemento)
+        if filhos:
+            partes = [
+                ET.tostring(filho, encoding="unicode")
+                for filho in filhos
+            ]
+            return "".join(partes).strip() or None
+
+        texto = html.unescape(safe_str(elemento.text)).strip()
+        return texto or None
+
+    xml_nfe = conteudo_elemento(elemento_xml_nfe)
+    xml_cancelamento = conteudo_elemento(elemento_xml_cancelamento)
+
+    if not xml_nfe:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "erro": "XML da nota não encontrado no retorno do Tiny.",
+                "codigo_erro": codigo_erro,
+                "mensagens": mensagens,
+            }
+        )
+
+    if not xml_nfe.lstrip().startswith("<?xml"):
+        xml_nfe = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_nfe
+
+    if xml_cancelamento and not xml_cancelamento.lstrip().startswith("<?xml"):
+        xml_cancelamento = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_cancelamento
+
+    return {
+        "xml_nfe": xml_nfe,
+        "xml_cancelamento": xml_cancelamento,
+    }
+
+
+def obter_xml_nota_fiscal_tiny(id_nota: str, filial: str = "sp") -> Dict[str, Optional[str]]:
+    resposta = tiny_post_xml(
+        "nota.fiscal.obter.xml.php",
+        {"id": id_nota},
+        filial=filial,
+    )
+    return extrair_xml_nfe_resposta_tiny(resposta)
+
+
+def nome_seguro_arquivo(valor: Any, padrao: str = "documento") -> str:
+    texto = re.sub(r"[^A-Za-z0-9._-]+", "_", safe_str(valor).strip())
+    texto = texto.strip("._-")
+    return texto or padrao
+
 def pesquisar_pedidos_tiny(
     data_inicial: date,
     data_final: date,
-    pagina: int = 1
+    pagina: int = 1,
+    filial: str = "sp"
 ) -> Dict[str, Any]:
     """
     Pesquisa pedidos no Tiny por período.
     """
     return tiny_get(
-        "pedidos.pesquisa.php",
-        {
-            "dataInicial": data_inicial.strftime("%d/%m/%Y"),
-            "dataFinal": data_final.strftime("%d/%m/%Y"),
-            "pagina": pagina
-        }
-    )
+    "pedidos.pesquisa.php",
+    {
+        "dataInicial": data_inicial.strftime("%d/%m/%Y"),
+        "dataFinal": data_final.strftime("%d/%m/%Y"),
+        "pagina": pagina
+    },
+    filial=filial
+)
 
 
-def obter_pedido_tiny(id_pedido: str) -> Dict[str, Any]:
+def obter_pedido_tiny(
+    id_pedido: str,
+    filial: str = "sp"
+) -> Dict[str, Any]:
     return tiny_get(
-        "pedido.obter.php",
-        {
-            "id": id_pedido
-        }
-    )
+    "pedido.obter.php",
+    {
+        "id": id_pedido
+    },
+    filial=filial
+)
 
 
 def extrair_lista_pedidos(resposta_tiny: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -438,7 +1065,8 @@ def extrair_lista_pedidos(resposta_tiny: Dict[str, Any]) -> List[Dict[str, Any]]
 def buscar_pedidos_periodo_tiny(
     data_inicial: date,
     data_final: date,
-    pausa_segundos: float = 0.8
+    pausa_segundos: float = 0.8,
+    filial: str = "sp"
 ) -> List[Dict[str, Any]]:
     """
     Busca pedidos paginando.
@@ -447,7 +1075,12 @@ def buscar_pedidos_periodo_tiny(
     pagina = 1
 
     while True:
-        resposta = pesquisar_pedidos_tiny(data_inicial, data_final, pagina)
+        resposta = pesquisar_pedidos_tiny(
+    data_inicial,
+    data_final,
+    pagina,
+    filial=filial
+)
         retorno = resposta.get("retorno", {})
 
         pedidos = extrair_lista_pedidos(resposta)
@@ -522,6 +1155,44 @@ def definir_canal_venda(pedido: Dict[str, Any]) -> str:
     return "COMERCIAL"
 
 
+def normalizar_texto_tag(valor: str) -> str:
+    texto = safe_str(valor).strip().upper()
+    substituicoes = {
+        "Á": "A", "À": "A", "Ã": "A", "Â": "A",
+        "É": "E", "Ê": "E", "Í": "I",
+        "Ó": "O", "Ô": "O", "Õ": "O",
+        "Ú": "U", "Ç": "C",
+    }
+    for origem, destino in substituicoes.items():
+        texto = texto.replace(origem, destino)
+    return " ".join(texto.split())
+
+
+TAGS_ORIGEM_CLIENTE = {
+    "INSTAGRAM": "Instagram",
+    "INSTA": "Instagram",
+    "TIKTOK": "TikTok",
+    "TIK TOK": "TikTok",
+    "GOOGLE": "Google",
+    "RUA": "Passando na Rua",
+    "PASSANDO NA RUA": "Passando na Rua",
+    "PASSOU NA RUA": "Passando na Rua",
+    "PROSPECCAO": "Prospecção",
+    "PROSPECTADO": "Prospecção",
+    "INDICACAO": "Indicação",
+    "INDICADO": "Indicação",
+}
+
+
+def definir_origem_cliente(pedido: Dict[str, Any]) -> str:
+    marcadores = extrair_marcadores_pedido(pedido)
+    for marcador in marcadores:
+        marcador_normalizado = normalizar_texto_tag(marcador)
+        if marcador_normalizado in TAGS_ORIGEM_CLIENTE:
+            return TAGS_ORIGEM_CLIENTE[marcador_normalizado]
+    return "Sem origem"
+
+
 def extrair_nome_cliente(pedido: Dict[str, Any]) -> str:
     cliente = pedido.get("cliente")
 
@@ -531,7 +1202,10 @@ def extrair_nome_cliente(pedido: Dict[str, Any]) -> str:
     return safe_str(pedido.get("nome") or pedido.get("cliente") or "")
 
 
-def normalizar_pedido_resumo(pedido: Dict[str, Any]) -> Dict[str, Any]:
+def normalizar_pedido_resumo(
+    pedido: Dict[str, Any],
+    filial: str = "sp"
+) -> Dict[str, Any]:
     id_pedido = safe_str(
         pedido.get("id")
         or pedido.get("numero")
@@ -554,35 +1228,37 @@ def normalizar_pedido_resumo(pedido: Dict[str, Any]) -> Dict[str, Any]:
 
     marcadores = extrair_marcadores_pedido(pedido)
     canal_venda = definir_canal_venda(pedido)
+    origem_cliente = definir_origem_cliente(pedido)
 
     return {
-        "tiny_id": id_pedido,
-        "numero": safe_str(pedido.get("numero", "")),
-        "numero_ecommerce": safe_str(pedido.get("numero_ecommerce", "")),
-        "data_pedido": data_pedido_iso,
-        "cliente": extrair_nome_cliente(pedido),
-        "situacao": safe_str(pedido.get("situacao", "")),
-        "valor_total": valor,
+    "tiny_id": id_pedido,
+    "numero": safe_str(pedido.get("numero", "")),
+    "numero_ecommerce": safe_str(pedido.get("numero_ecommerce", "")),
+    "data_pedido": data_pedido_iso,
+    "cliente": extrair_nome_cliente(pedido),
+    "situacao": safe_str(pedido.get("situacao", "")),
+    "valor_total": valor,
 
-        # Campos para separar PDV x Comercial
-        "marcadores": marcadores,
-        "canal_venda": canal_venda,
+    "marcadores": marcadores,
+    "canal_venda": canal_venda,
+    "origem_cliente": origem_cliente,
 
-        # Campos úteis para próximos indicadores
-        "id_vendedor": safe_str(pedido.get("id_vendedor", "")),
-        "nome_vendedor": safe_str(pedido.get("nome_vendedor", "")),
-        "forma_pagamento": safe_str(pedido.get("forma_pagamento", "")),
-        "meio_pagamento": safe_str(pedido.get("meio_pagamento", "")),
+    "filial": filial,
 
-        # Mantém o JSON completo para auditoria/debug
-        "raw": pedido,
-        "updated_at": datetime.now().isoformat()
-    }
+    "id_vendedor": safe_str(pedido.get("id_vendedor", "")),
+    "nome_vendedor": safe_str(pedido.get("nome_vendedor", "")),
+    "forma_pagamento": safe_str(pedido.get("forma_pagamento", "")),
+    "meio_pagamento": safe_str(pedido.get("meio_pagamento", "")),
+
+    "raw": pedido,
+    "updated_at": datetime.now().isoformat()
+}
 
 def extrair_itens_do_pedido_completo(
     pedido_completo: Dict[str, Any],
     pedido_id: str,
-    data_pedido: Optional[str]
+    data_pedido: Optional[str],
+    filial: str = "sp"
 ) -> List[Dict[str, Any]]:
     retorno = pedido_completo.get("retorno", {})
     pedido = retorno.get("pedido", {})
@@ -603,6 +1279,7 @@ def extrair_itens_do_pedido_completo(
         itens.append({
     "pedido_tiny_id": safe_str(pedido_id),
     "data_pedido": data_pedido,
+    "filial": filial,
 
     # Mantém compatibilidade com banco novo e banco antigo
     "produto_nome": produto_nome,
@@ -686,7 +1363,8 @@ def salvar_sync_log(
     status: str,
     mensagem: str,
     total_pedidos: int = 0,
-    faturamento: float = 0.0
+    faturamento: float = 0.0,
+    filial: str = "sp"
 ):
     payload = {
         "tipo": tipo,
@@ -696,6 +1374,7 @@ def salvar_sync_log(
         "mensagem": mensagem,
         "total_pedidos": total_pedidos,
         "faturamento": faturamento,
+        "filial": normalizar_filial(filial),
         "created_at": datetime.now().isoformat()
     }
 
@@ -739,14 +1418,15 @@ def limpar_itens_dos_pedidos(pedidos_normalizados: List[Dict[str, Any]]):
             pass
 
 
-def limpar_ranking_periodo(data_inicio: date, data_fim: date, tipo: str):
+def limpar_ranking_periodo(data_inicio: date, data_fim: date, tipo: str, filial: str = "sp"):
     try:
         supabase_delete(
             "ranking_periodo",
             {
                 "data_inicio": f"eq.{data_inicio.isoformat()}",
                 "data_fim": f"eq.{data_fim.isoformat()}",
-                "tipo": f"eq.{tipo}"
+                "tipo": f"eq.{tipo}",
+                "filial": f"eq.{normalizar_filial(filial)}"
             }
         )
     except Exception:
@@ -755,13 +1435,18 @@ def sincronizar_periodo(
     data_inicio: date,
     data_fim: date,
     tipo: str = "periodo",
-    buscar_itens: bool = True
+    buscar_itens: bool = True,
+    filial: str = "sp"
 ) -> Dict[str, Any]:
     """
     Busca pedidos no Tiny, salva pedidos, itens e resumos no Supabase.
     """
 
-    pedidos_tiny = buscar_pedidos_periodo_tiny(data_inicio, data_fim)
+    pedidos_tiny = buscar_pedidos_periodo_tiny(
+    data_inicio,
+    data_fim,
+    filial=filial
+)
 
     pedidos_normalizados = []
     itens_normalizados = []
@@ -784,14 +1469,19 @@ def sincronizar_periodo(
 
         if id_para_obter:
             try:
-                pedido_completo = obter_pedido_tiny(id_para_obter)
+                pedido_completo = obter_pedido_tiny(
+    id_para_obter,
+    filial=filial
+)
                 pedido_detalhado = pedido_completo.get("retorno", {}).get("pedido", pedido_raw)
                 time.sleep(0.7)
             except Exception:
                 pedido_detalhado = pedido_raw
 
-        pedido_norm = normalizar_pedido_resumo(pedido_detalhado)
-
+        pedido_norm = normalizar_pedido_resumo(
+    pedido_detalhado,
+    filial=filial
+)
         if not pedido_norm.get("tiny_id"):
             continue
 
@@ -803,13 +1493,17 @@ def sincronizar_periodo(
         if buscar_itens:
             try:
                 if not pedido_completo:
-                    pedido_completo = obter_pedido_tiny(pedido_norm["tiny_id"])
+                    pedido_completo = obter_pedido_tiny(
+    pedido_norm["tiny_id"],
+    filial=filial
+)
                     time.sleep(0.7)
 
                 itens = extrair_itens_do_pedido_completo(
                     pedido_completo,
                     pedido_norm["tiny_id"],
-                    pedido_norm["data_pedido"]
+                    pedido_norm["data_pedido"],
+                    filial=filial
                 )
                 itens_normalizados.extend(itens)
             except Exception:
@@ -886,6 +1580,7 @@ def sincronizar_periodo(
             "total_unidades_vendidas": unidades_dia,
             "total_produtos_diferentes": produtos_diferentes,
             "origem": "Tiny/Olist",
+            "filial": normalizar_filial(filial),
             "updated_at": datetime.now().isoformat()
         }
 
@@ -894,7 +1589,7 @@ def sincronizar_periodo(
                 "resumo_diario",
                 resumo_diario_payload,
                 upsert=True,
-                on_conflict="data_resumo"
+                on_conflict="data_resumo,filial"
             )
         except Exception:
             pass
@@ -908,6 +1603,7 @@ def sincronizar_periodo(
             "faturamento": calculado["faturamento"],
             "total_pedidos": calculado["total_pedidos"],
             "ticket_medio": calculado["ticket_medio"],
+            "filial": normalizar_filial(filial),
             "updated_at": datetime.now().isoformat()
         }
 
@@ -925,6 +1621,7 @@ def sincronizar_periodo(
             "faturamento": calculado["faturamento"],
             "total_pedidos": calculado["total_pedidos"],
             "ticket_medio": calculado["ticket_medio"],
+            "filial": normalizar_filial(filial),
             "updated_at": datetime.now().isoformat()
         }
 
@@ -947,11 +1644,12 @@ def sincronizar_periodo(
             "quantidade_total": item["quantidade_total"],
             "valor_total": item["valor_total"],
             "percentual_participacao": item["percentual_participacao"],
+            "filial": normalizar_filial(filial),
             "updated_at": datetime.now().isoformat()
         })
 
     if ranking_periodo_payload:
-        limpar_ranking_periodo(data_inicio, data_fim, tipo)
+        limpar_ranking_periodo(data_inicio, data_fim, tipo, filial=filial)
 
         try:
             supabase_insert(
@@ -969,7 +1667,8 @@ def sincronizar_periodo(
         status="ok",
         mensagem="Sincronização concluída.",
         total_pedidos=calculado["total_pedidos"],
-        faturamento=calculado["faturamento"]
+        faturamento=calculado["faturamento"],
+        filial=filial
     )
 
     return {
@@ -980,6 +1679,7 @@ def sincronizar_periodo(
         "total_pedidos": calculado["total_pedidos"],
         "faturamento": calculado["faturamento"],
         "ticket_medio": calculado["ticket_medio"],
+        "filial": normalizar_filial(filial),
         "top_10": calculado["ranking"][:10]
     }
 
@@ -992,6 +1692,739 @@ class PeriodoBody(BaseModel):
     data_inicio: str
     data_fim: str
 
+# ============================================================
+# MODELOS — REGRAS TRIBUTÁRIAS
+# ============================================================
+
+
+
+class FiscalMotorSimularBody(BaseModel):
+    produto_id: Optional[str] = None
+    ncm: Optional[str] = None
+    uf_origem: str
+    uf_destino: str
+    operacao: str = "venda"
+    regime: str
+    filial: Optional[str] = None
+    consumidor_final: Optional[bool] = None
+    contribuinte_icms: Optional[bool] = None
+    pessoa_fisica: Optional[bool] = None
+    marketplace: Optional[bool] = None
+    data_operacao: Optional[str] = None
+
+class FiscalRegraBase(BaseModel):
+    empresa_id: Optional[str] = None
+    filial: str = "sp"
+    nome: str
+    descricao: Optional[str] = None
+    ativa: bool = True
+    prioridade: int = 100
+    regime_tributario: str
+    tipo_operacao: str = "venda"
+    uf_origem: Optional[str] = None
+    uf_destino: Optional[str] = None
+    categoria_id: Optional[str] = None
+    ncm: Optional[str] = None
+    cfop: Optional[str] = None
+    cst_icms: Optional[str] = None
+    csosn: Optional[str] = None
+    aliquota_icms: float = 0
+    reducao_bc: float = 0
+    tem_st: bool = False
+    mva: float = 0
+    aliquota_fcp: float = 0
+    cst_pis: Optional[str] = None
+    aliquota_pis: float = 0
+    cst_cofins: Optional[str] = None
+    aliquota_cofins: float = 0
+    cst_ipi: Optional[str] = None
+    aliquota_ipi: float = 0
+    consumidor_final: Optional[bool] = None
+    contribuinte_icms: Optional[bool] = None
+    pessoa_fisica: Optional[bool] = None
+    marketplace: Optional[bool] = None
+    vigencia_inicio: Optional[str] = None
+    vigencia_fim: Optional[str] = None
+    observacoes: Optional[str] = None
+    produtos: List[str] = []
+
+
+class FiscalRegraCriar(FiscalRegraBase):
+    pass
+
+
+class FiscalRegraAtualizar(BaseModel):
+    empresa_id: Optional[str] = None
+    filial: Optional[str] = None
+    nome: Optional[str] = None
+    descricao: Optional[str] = None
+    ativa: Optional[bool] = None
+    prioridade: Optional[int] = None
+    regime_tributario: Optional[str] = None
+    tipo_operacao: Optional[str] = None
+    uf_origem: Optional[str] = None
+    uf_destino: Optional[str] = None
+    categoria_id: Optional[str] = None
+    ncm: Optional[str] = None
+    cfop: Optional[str] = None
+    cst_icms: Optional[str] = None
+    csosn: Optional[str] = None
+    aliquota_icms: Optional[float] = None
+    reducao_bc: Optional[float] = None
+    tem_st: Optional[bool] = None
+    mva: Optional[float] = None
+    aliquota_fcp: Optional[float] = None
+    cst_pis: Optional[str] = None
+    aliquota_pis: Optional[float] = None
+    cst_cofins: Optional[str] = None
+    aliquota_cofins: Optional[float] = None
+    cst_ipi: Optional[str] = None
+    aliquota_ipi: Optional[float] = None
+    consumidor_final: Optional[bool] = None
+    contribuinte_icms: Optional[bool] = None
+    pessoa_fisica: Optional[bool] = None
+    marketplace: Optional[bool] = None
+    vigencia_inicio: Optional[str] = None
+    vigencia_fim: Optional[str] = None
+    observacoes: Optional[str] = None
+    produtos: Optional[List[str]] = None
+
+
+def modelo_para_dict(modelo: BaseModel, exclude_unset: bool = False) -> Dict[str, Any]:
+    if hasattr(modelo, "model_dump"):
+        return modelo.model_dump(exclude_unset=exclude_unset)
+    return modelo.dict(exclude_unset=exclude_unset)
+
+
+REGIMES_TRIBUTARIOS_VALIDOS = {
+    "simples_nacional", "lucro_presumido", "lucro_real"
+}
+
+TIPOS_OPERACAO_VALIDOS = {
+    "venda", "compra", "transferencia", "devolucao",
+    "bonificacao", "industrializacao", "remessa"
+}
+
+UFS_VALIDAS = {
+    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO",
+    "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI",
+    "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"
+}
+
+CAMPOS_PERCENTUAIS_FISCAL = {
+    "aliquota_icms", "reducao_bc", "aliquota_fcp", "aliquota_pis",
+    "aliquota_cofins", "aliquota_ipi"
+}
+
+
+def normalizar_codigo_numerico(valor: Optional[str], tamanho_maximo: int) -> Optional[str]:
+    if valor is None:
+        return None
+    texto = re.sub(r"\D", "", safe_str(valor))
+    if not texto:
+        return None
+    if len(texto) > tamanho_maximo:
+        raise HTTPException(status_code=400, detail=f"Código inválido: máximo de {tamanho_maximo} dígitos.")
+    return texto
+
+
+def validar_payload_regra_fiscal(payload: Dict[str, Any], parcial: bool = False) -> Dict[str, Any]:
+    dados = dict(payload)
+
+    if "nome" in dados:
+        dados["nome"] = safe_str(dados.get("nome")).strip()
+        if not dados["nome"]:
+            raise HTTPException(status_code=400, detail="O nome da regra é obrigatório.")
+    elif not parcial:
+        raise HTTPException(status_code=400, detail="O nome da regra é obrigatório.")
+
+    if "filial" in dados and dados.get("filial") is not None:
+        filial_raw = safe_str(dados.get("filial")).strip().lower()
+        if filial_raw not in {"sp", "mg", "all"}:
+            raise HTTPException(status_code=400, detail="Filial inválida. Use sp, mg ou all.")
+        dados["filial"] = filial_raw
+
+    if "regime_tributario" in dados and dados.get("regime_tributario") is not None:
+        regime = safe_str(dados.get("regime_tributario")).strip().lower()
+        if regime not in REGIMES_TRIBUTARIOS_VALIDOS:
+            raise HTTPException(status_code=400, detail="Regime tributário inválido.")
+        dados["regime_tributario"] = regime
+    elif not parcial:
+        raise HTTPException(status_code=400, detail="O regime tributário é obrigatório.")
+
+    if "tipo_operacao" in dados and dados.get("tipo_operacao") is not None:
+        operacao = safe_str(dados.get("tipo_operacao")).strip().lower()
+        if operacao not in TIPOS_OPERACAO_VALIDOS:
+            raise HTTPException(status_code=400, detail="Tipo de operação inválido.")
+        dados["tipo_operacao"] = operacao
+
+    for campo_uf in ["uf_origem", "uf_destino"]:
+        if campo_uf in dados and dados.get(campo_uf) is not None:
+            uf = safe_str(dados.get(campo_uf)).strip().upper()
+            if uf and uf not in UFS_VALIDAS:
+                raise HTTPException(status_code=400, detail=f"{campo_uf} inválida.")
+            dados[campo_uf] = uf or None
+
+    if "ncm" in dados:
+        dados["ncm"] = normalizar_codigo_numerico(dados.get("ncm"), 8)
+    if "cfop" in dados:
+        dados["cfop"] = normalizar_codigo_numerico(dados.get("cfop"), 4)
+
+    for campo in ["cst_icms", "csosn", "cst_pis", "cst_cofins", "cst_ipi"]:
+        if campo in dados:
+            dados[campo] = normalizar_codigo_numerico(dados.get(campo), 3)
+
+    if "prioridade" in dados and dados.get("prioridade") is not None:
+        if int(dados["prioridade"]) < 0:
+            raise HTTPException(status_code=400, detail="A prioridade não pode ser negativa.")
+        dados["prioridade"] = int(dados["prioridade"])
+
+    for campo in CAMPOS_PERCENTUAIS_FISCAL:
+        if campo in dados and dados.get(campo) is not None:
+            valor = float(dados[campo])
+            if valor < 0 or valor > 100:
+                raise HTTPException(status_code=400, detail=f"{campo} deve estar entre 0 e 100.")
+            dados[campo] = valor
+
+    if "mva" in dados and dados.get("mva") is not None:
+        dados["mva"] = float(dados["mva"])
+        if dados["mva"] < 0:
+            raise HTTPException(status_code=400, detail="MVA não pode ser negativa.")
+
+    for campo_data in ["vigencia_inicio", "vigencia_fim"]:
+        if campo_data in dados and dados.get(campo_data):
+            dados[campo_data] = parse_data(safe_str(dados[campo_data])).isoformat()
+
+    inicio = dados.get("vigencia_inicio")
+    fim = dados.get("vigencia_fim")
+    if inicio and fim and fim < inicio:
+        raise HTTPException(status_code=400, detail="vigencia_fim não pode ser menor que vigencia_inicio.")
+
+    return dados
+
+
+def usuario_id_uuid_ou_none(usuario: Dict[str, Any]) -> Optional[str]:
+    valor = safe_str(usuario.get("id")).strip()
+    return valor if re.fullmatch(r"[0-9a-fA-F-]{36}", valor) else None
+
+
+def registrar_historico_fiscal(
+    regra_id: str,
+    usuario: Dict[str, Any],
+    acao: str,
+    antes: Optional[Dict[str, Any]] = None,
+    depois: Optional[Dict[str, Any]] = None,
+    observacoes: Optional[str] = None
+):
+    payload = {
+        "regra_id": regra_id,
+        "usuario_id": usuario_id_uuid_ou_none(usuario),
+        "usuario_nome": usuario.get("nome") or usuario.get("email") or "Sistema",
+        "acao": acao,
+        "antes": antes,
+        "depois": depois,
+        "observacoes": observacoes,
+        "created_at": datetime.now().isoformat()
+    }
+    supabase_insert("fiscal_historico", payload)
+
+
+def buscar_regra_fiscal_por_id(regra_id: str) -> Dict[str, Any]:
+    registros = supabase_get(
+        "fiscal_regras",
+        {"id": f"eq.{regra_id}", "select": "*", "limit": "1"}
+    )
+    if not registros:
+        raise HTTPException(status_code=404, detail="Regra tributária não encontrada.")
+    return registros[0]
+
+
+def buscar_produtos_da_regra(regra_id: str) -> List[str]:
+    vinculos = supabase_get(
+        "fiscal_regras_produtos",
+        {
+            "regra_id": f"eq.{regra_id}",
+            "select": "produto_id",
+            "order": "created_at.asc"
+        }
+    )
+    return [safe_str(item.get("produto_id")) for item in vinculos if item.get("produto_id")]
+
+
+def substituir_produtos_da_regra(regra_id: str, produtos: Optional[List[str]]):
+    if produtos is None:
+        return
+
+    supabase_delete("fiscal_regras_produtos", {"regra_id": f"eq.{regra_id}"})
+    produtos_limpos = list(dict.fromkeys(
+        safe_str(produto).strip() for produto in produtos if safe_str(produto).strip()
+    ))
+    if produtos_limpos:
+        supabase_insert(
+            "fiscal_regras_produtos",
+            [{"regra_id": regra_id, "produto_id": produto} for produto in produtos_limpos]
+        )
+
+
+def validar_acesso_regra_fiscal(regra: Dict[str, Any], usuario: Dict[str, Any]):
+    filial_usuario = normalizar_filial(usuario.get("filial") or "sp")
+    filial_regra = normalizar_filial(regra.get("filial") or "sp")
+    if filial_usuario != "all" and filial_regra not in {filial_usuario, "all"}:
+        raise HTTPException(status_code=403, detail="Usuário sem permissão para acessar esta regra.")
+
+
+# ============================================================
+# ROTAS — CRUD DE REGRAS TRIBUTÁRIAS
+# ============================================================
+
+@app.get("/fiscal/regras")
+def listar_regras_fiscais(
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    regime_tributario: Optional[str] = Query(None),
+    tipo_operacao: Optional[str] = Query(None),
+    ncm: Optional[str] = Query(None),
+    ativa: Optional[bool] = Query(None),
+    busca: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    filial_resolvida = resolver_filial_autorizada(filial, usuario, permitir_all=True)
+    params: Dict[str, str] = {
+        "select": "*",
+        "order": "prioridade.asc,nome.asc",
+        "limit": str(limit),
+        "offset": str(offset)
+    }
+
+    if filial_resolvida != "all":
+        # Regras globais também valem para a filial selecionada.
+        params["filial"] = f"in.({filial_resolvida},all)"
+    if regime_tributario:
+        params["regime_tributario"] = f"eq.{safe_str(regime_tributario).lower().strip()}"
+    if tipo_operacao:
+        params["tipo_operacao"] = f"eq.{safe_str(tipo_operacao).lower().strip()}"
+    if ncm:
+        params["ncm"] = f"eq.{normalizar_codigo_numerico(ncm, 8)}"
+    if ativa is not None:
+        params["ativa"] = f"eq.{str(ativa).lower()}"
+    if busca and safe_str(busca).strip():
+        termo = safe_str(busca).strip().replace(",", " ")
+        params["or"] = f"(nome.ilike.*{termo}*,descricao.ilike.*{termo}*,ncm.ilike.*{termo}*)"
+
+    regras = supabase_get("fiscal_regras", params)
+    return {
+        "status": "ok",
+        "filial": filial_resolvida,
+        "quantidade": len(regras),
+        "dados": regras
+    }
+
+
+@app.get("/fiscal/regras/{regra_id}")
+def obter_regra_fiscal(
+    regra_id: str,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    regra = buscar_regra_fiscal_por_id(regra_id)
+    validar_acesso_regra_fiscal(regra, usuario)
+    regra["produtos"] = buscar_produtos_da_regra(regra_id)
+    return {"status": "ok", "dados": regra}
+
+
+@app.post("/fiscal/regras", status_code=201)
+def criar_regra_fiscal(
+    body: FiscalRegraCriar,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    payload = modelo_para_dict(body)
+    produtos = payload.pop("produtos", [])
+    payload = validar_payload_regra_fiscal(payload, parcial=False)
+
+    filial_regra = resolver_filial_autorizada(payload.get("filial"), usuario, permitir_all=True)
+    payload["filial"] = filial_regra
+    payload["created_by"] = usuario_id_uuid_ou_none(usuario)
+    payload["updated_by"] = usuario_id_uuid_ou_none(usuario)
+    payload["created_at"] = datetime.now().isoformat()
+    payload["updated_at"] = datetime.now().isoformat()
+
+    criado = supabase_insert("fiscal_regras", payload)
+    if not criado:
+        raise HTTPException(status_code=500, detail="Supabase não retornou a regra criada.")
+
+    regra = criado[0] if isinstance(criado, list) else criado
+    regra_id = safe_str(regra.get("id"))
+    substituir_produtos_da_regra(regra_id, produtos)
+    regra["produtos"] = buscar_produtos_da_regra(regra_id)
+    registrar_historico_fiscal(regra_id, usuario, "criou", depois=regra)
+
+    return {"status": "ok", "mensagem": "Regra tributária criada.", "dados": regra}
+
+
+@app.put("/fiscal/regras/{regra_id}")
+def atualizar_regra_fiscal(
+    regra_id: str,
+    body: FiscalRegraAtualizar,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    anterior = buscar_regra_fiscal_por_id(regra_id)
+    validar_acesso_regra_fiscal(anterior, usuario)
+    anterior_completo = dict(anterior)
+    anterior_completo["produtos"] = buscar_produtos_da_regra(regra_id)
+
+    payload = modelo_para_dict(body, exclude_unset=True)
+    produtos_informados = "produtos" in payload
+    produtos = payload.pop("produtos", None)
+    payload = validar_payload_regra_fiscal(payload, parcial=True)
+
+    if "filial" in payload:
+        payload["filial"] = resolver_filial_autorizada(payload["filial"], usuario, permitir_all=True)
+
+    if not payload and not produtos_informados:
+        raise HTTPException(status_code=400, detail="Nenhum campo foi informado para atualização.")
+
+    if payload:
+        payload["updated_by"] = usuario_id_uuid_ou_none(usuario)
+        payload["updated_at"] = datetime.now().isoformat()
+        atualizado = supabase_patch("fiscal_regras", {"id": f"eq.{regra_id}"}, payload)
+        regra = atualizado[0] if isinstance(atualizado, list) and atualizado else buscar_regra_fiscal_por_id(regra_id)
+    else:
+        regra = buscar_regra_fiscal_por_id(regra_id)
+
+    if produtos_informados:
+        substituir_produtos_da_regra(regra_id, produtos)
+
+    regra = buscar_regra_fiscal_por_id(regra_id)
+    regra["produtos"] = buscar_produtos_da_regra(regra_id)
+
+    acao = "editou"
+    if anterior.get("ativa") is False and regra.get("ativa") is True:
+        acao = "ativou"
+    elif anterior.get("ativa") is True and regra.get("ativa") is False:
+        acao = "desativou"
+
+    registrar_historico_fiscal(regra_id, usuario, acao, antes=anterior_completo, depois=regra)
+    return {"status": "ok", "mensagem": "Regra tributária atualizada.", "dados": regra}
+
+
+@app.delete("/fiscal/regras/{regra_id}")
+def excluir_regra_fiscal(
+    regra_id: str,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    anterior = buscar_regra_fiscal_por_id(regra_id)
+    validar_acesso_regra_fiscal(anterior, usuario)
+    anterior["produtos"] = buscar_produtos_da_regra(regra_id)
+
+    # Exclusão lógica: preserva histórico e evita quebrar auditorias antigas.
+    atualizado = supabase_patch(
+        "fiscal_regras",
+        {"id": f"eq.{regra_id}"},
+        {
+            "ativa": False,
+            "updated_by": usuario_id_uuid_ou_none(usuario),
+            "updated_at": datetime.now().isoformat()
+        }
+    )
+    regra = atualizado[0] if isinstance(atualizado, list) and atualizado else buscar_regra_fiscal_por_id(regra_id)
+    regra["produtos"] = buscar_produtos_da_regra(regra_id)
+    registrar_historico_fiscal(
+        regra_id, usuario, "desativou", antes=anterior, depois=regra,
+        observacoes="Exclusão lógica realizada pelo endpoint DELETE."
+    )
+    return {
+        "status": "ok",
+        "mensagem": "Regra tributária desativada com sucesso.",
+        "dados": regra
+    }
+
+
+@app.get("/fiscal/regras/{regra_id}/historico")
+def listar_historico_regra_fiscal(
+    regra_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    regra = buscar_regra_fiscal_por_id(regra_id)
+    validar_acesso_regra_fiscal(regra, usuario)
+    dados = supabase_get(
+        "fiscal_historico",
+        {
+            "regra_id": f"eq.{regra_id}",
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": str(limit)
+        }
+    )
+    return {"status": "ok", "quantidade": len(dados), "dados": dados}
+
+
+
+
+# ============================================================
+# MOTOR TRIBUTÁRIO
+# ============================================================
+
+def _valor_booleano_compativel(valor_regra: Any, valor_entrada: Optional[bool]) -> bool:
+    """Campo nulo na regra funciona como curinga; valor definido exige igualdade."""
+    if valor_regra is None:
+        return True
+    if valor_entrada is None:
+        return False
+    return bool(valor_regra) == bool(valor_entrada)
+
+
+def _data_vigencia_compativel(regra: Dict[str, Any], data_operacao: date) -> bool:
+    inicio = regra.get("vigencia_inicio")
+    fim = regra.get("vigencia_fim")
+    if inicio and data_operacao < parse_data(safe_str(inicio)[:10]):
+        return False
+    if fim and data_operacao > parse_data(safe_str(fim)[:10]):
+        return False
+    return True
+
+
+def _campo_texto_compativel(valor_regra: Any, valor_entrada: Optional[str]) -> bool:
+    """Campo vazio/nulo na regra funciona como curinga."""
+    regra_txt = safe_str(valor_regra).strip().upper()
+    entrada_txt = safe_str(valor_entrada).strip().upper()
+    return not regra_txt or regra_txt == entrada_txt
+
+
+def _calcular_especificidade_regra(
+    regra: Dict[str, Any],
+    produto_especifico: bool,
+    ncm_entrada: Optional[str],
+    uf_origem: str,
+    uf_destino: str,
+    contexto: Dict[str, Optional[bool]]
+) -> int:
+    """Quanto maior, mais específica é a regra."""
+    pontos = 0
+    if produto_especifico:
+        pontos += 1000
+    if regra.get("ncm") and safe_str(regra.get("ncm")) == safe_str(ncm_entrada):
+        pontos += 300
+    if regra.get("uf_origem") and safe_str(regra.get("uf_origem")).upper() == uf_origem:
+        pontos += 100
+    if regra.get("uf_destino") and safe_str(regra.get("uf_destino")).upper() == uf_destino:
+        pontos += 100
+    if regra.get("categoria_id"):
+        pontos += 20
+    for campo, valor in contexto.items():
+        if regra.get(campo) is not None and valor is not None:
+            pontos += 10
+    if safe_str(regra.get("filial")).lower() != "all":
+        pontos += 5
+    return pontos
+
+
+def resolver_regra_tributaria(
+    *,
+    produto_id: Optional[str],
+    ncm: Optional[str],
+    uf_origem: str,
+    uf_destino: str,
+    operacao: str,
+    regime: str,
+    filial: str,
+    consumidor_final: Optional[bool],
+    contribuinte_icms: Optional[bool],
+    pessoa_fisica: Optional[bool],
+    marketplace: Optional[bool],
+    data_operacao: date
+) -> Dict[str, Any]:
+    """Resolve a melhor regra ativa usando especificidade e prioridade."""
+    params: Dict[str, str] = {
+        "select": "*",
+        "ativa": "eq.true",
+        "regime_tributario": f"eq.{regime}",
+        "tipo_operacao": f"eq.{operacao}",
+        "order": "prioridade.asc,created_at.desc",
+        "limit": "1000",
+    }
+    if filial != "all":
+        params["filial"] = f"in.({filial},all)"
+
+    regras = supabase_get("fiscal_regras", params)
+
+    ids_regras_produto = set()
+    if produto_id:
+        vinculos = supabase_get(
+            "fiscal_regras_produtos",
+            {
+                "select": "regra_id",
+                "produto_id": f"eq.{produto_id}",
+                "limit": "1000",
+            },
+        )
+        ids_regras_produto = {safe_str(v.get("regra_id")) for v in vinculos}
+
+    contexto = {
+        "consumidor_final": consumidor_final,
+        "contribuinte_icms": contribuinte_icms,
+        "pessoa_fisica": pessoa_fisica,
+        "marketplace": marketplace,
+    }
+
+    candidatas = []
+    descartes = {
+        "vigencia": 0, "ncm": 0, "uf": 0, "contexto": 0, "produto": 0
+    }
+
+    for regra in regras:
+        regra_id = safe_str(regra.get("id"))
+        tem_vinculos = bool(supabase_get(
+            "fiscal_regras_produtos",
+            {"select": "id", "regra_id": f"eq.{regra_id}", "limit": "1"}
+        ))
+        produto_especifico = regra_id in ids_regras_produto
+
+        # Regra ligada a produto não pode ser aplicada a outro produto.
+        if tem_vinculos and not produto_especifico:
+            descartes["produto"] += 1
+            continue
+        if not _data_vigencia_compativel(regra, data_operacao):
+            descartes["vigencia"] += 1
+            continue
+        if not _campo_texto_compativel(regra.get("ncm"), ncm):
+            descartes["ncm"] += 1
+            continue
+        if not _campo_texto_compativel(regra.get("uf_origem"), uf_origem):
+            descartes["uf"] += 1
+            continue
+        if not _campo_texto_compativel(regra.get("uf_destino"), uf_destino):
+            descartes["uf"] += 1
+            continue
+        if not all(_valor_booleano_compativel(regra.get(c), v) for c, v in contexto.items()):
+            descartes["contexto"] += 1
+            continue
+
+        especificidade = _calcular_especificidade_regra(
+            regra, produto_especifico, ncm, uf_origem, uf_destino, contexto
+        )
+        prioridade = int(regra.get("prioridade") or 100)
+        candidatas.append({
+            "regra": regra,
+            "produto_especifico": produto_especifico,
+            "especificidade": especificidade,
+            "prioridade": prioridade,
+        })
+
+    if not candidatas:
+        return {
+            "encontrou": False,
+            "regra": None,
+            "criterio": None,
+            "total_regras_avaliadas": len(regras),
+            "descartes": descartes,
+        }
+
+    candidatas.sort(key=lambda item: (-item["especificidade"], item["prioridade"], safe_str(item["regra"].get("created_at"))))
+    vencedora = candidatas[0]
+    regra = vencedora["regra"]
+
+    if vencedora["produto_especifico"]:
+        criterio = "produto"
+    elif regra.get("ncm") and regra.get("uf_origem") and regra.get("uf_destino"):
+        criterio = "ncm_uf"
+    elif regra.get("ncm"):
+        criterio = "ncm"
+    else:
+        criterio = "geral"
+
+    return {
+        "encontrou": True,
+        "regra": regra,
+        "criterio": criterio,
+        "especificidade": vencedora["especificidade"],
+        "prioridade": vencedora["prioridade"],
+        "total_regras_avaliadas": len(regras),
+        "total_candidatas": len(candidatas),
+        "descartes": descartes,
+    }
+
+
+@app.post("/fiscal/motor/simular")
+def simular_motor_tributario(
+    body: FiscalMotorSimularBody,
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    payload = modelo_para_dict(body)
+    regime = safe_str(payload.get("regime")).strip().lower()
+    operacao = safe_str(payload.get("operacao") or "venda").strip().lower()
+    if regime not in REGIMES_TRIBUTARIOS_VALIDOS:
+        raise HTTPException(status_code=400, detail="Regime tributário inválido.")
+    if operacao not in TIPOS_OPERACAO_VALIDOS:
+        raise HTTPException(status_code=400, detail="Tipo de operação inválido.")
+
+    uf_origem = safe_str(payload.get("uf_origem")).strip().upper()
+    uf_destino = safe_str(payload.get("uf_destino")).strip().upper()
+    if uf_origem not in UFS_VALIDAS or uf_destino not in UFS_VALIDAS:
+        raise HTTPException(status_code=400, detail="UF de origem ou destino inválida.")
+
+    ncm = normalizar_codigo_numerico(payload.get("ncm"), 8)
+    if ncm and len(ncm) != 8:
+        raise HTTPException(status_code=400, detail="NCM deve possuir exatamente 8 dígitos.")
+
+    filial = resolver_filial_autorizada(payload.get("filial"), usuario, permitir_all=True)
+    data_operacao = parse_data(payload["data_operacao"]) if payload.get("data_operacao") else hoje_br()
+
+    resultado = resolver_regra_tributaria(
+        produto_id=safe_str(payload.get("produto_id")).strip() or None,
+        ncm=ncm,
+        uf_origem=uf_origem,
+        uf_destino=uf_destino,
+        operacao=operacao,
+        regime=regime,
+        filial=filial,
+        consumidor_final=payload.get("consumidor_final"),
+        contribuinte_icms=payload.get("contribuinte_icms"),
+        pessoa_fisica=payload.get("pessoa_fisica"),
+        marketplace=payload.get("marketplace"),
+        data_operacao=data_operacao,
+    )
+
+    if not resultado["encontrou"]:
+        return {
+            "status": "sem_regra",
+            "mensagem": "Nenhuma regra tributária compatível foi encontrada.",
+            "entrada": {**payload, "ncm": ncm, "filial": filial, "data_operacao": data_operacao.isoformat()},
+            "diagnostico": resultado,
+        }
+
+    regra = resultado["regra"]
+    return {
+        "status": "ok",
+        "encontrou": True,
+        "criterio": resultado["criterio"],
+        "regra_id": regra.get("id"),
+        "regra_nome": regra.get("nome"),
+        "filial_regra": regra.get("filial"),
+        "cfop": regra.get("cfop"),
+        "cst_icms": regra.get("cst_icms"),
+        "csosn": regra.get("csosn"),
+        "aliquota_icms": regra.get("aliquota_icms") or 0,
+        "reducao_bc": regra.get("reducao_bc") or 0,
+        "tem_st": bool(regra.get("tem_st")),
+        "mva": regra.get("mva") or 0,
+        "aliquota_fcp": regra.get("aliquota_fcp") or 0,
+        "cst_pis": regra.get("cst_pis"),
+        "aliquota_pis": regra.get("aliquota_pis") or 0,
+        "cst_cofins": regra.get("cst_cofins"),
+        "aliquota_cofins": regra.get("aliquota_cofins") or 0,
+        "cst_ipi": regra.get("cst_ipi"),
+        "aliquota_ipi": regra.get("aliquota_ipi") or 0,
+        "vigencia_inicio": regra.get("vigencia_inicio"),
+        "vigencia_fim": regra.get("vigencia_fim"),
+        "motor": {
+            "especificidade": resultado["especificidade"],
+            "prioridade": resultado["prioridade"],
+            "total_regras_avaliadas": resultado["total_regras_avaliadas"],
+            "total_candidatas": resultado["total_candidatas"],
+        },
+    }
+
 
 # ============================================================
 # ROTAS BÁSICAS
@@ -1002,7 +2435,7 @@ def home():
     return {
         "status": "online",
         "app": "MHM Dashboard Tiny API",
-        "version": "2.0.1"
+        "version": "2.5.0"
     }
 
 
@@ -1012,7 +2445,8 @@ def health():
         "status": "ok",
         "tiny_token_ok": bool(TINY_TOKEN),
         "supabase_url_ok": bool(SUPABASE_URL),
-        "supabase_key_ok": bool(SUPABASE_SERVICE_ROLE_KEY)
+        "supabase_key_ok": bool(SUPABASE_SERVICE_ROLE_KEY),
+        "jwt_auth_enabled": JWT_AUTH_ENABLED
     }
 
 
@@ -1034,10 +2468,23 @@ def rotas():
             "/db/resumo-periodo",
             "/db/ranking-periodo",
             "/db/faturamento-canais",
+            "/db/faturamento-origens",
             "/db/sync-logs"
         ],
         "configuracoes": [
             "/configuracoes/data-inicio-tiny"
+        ],
+        "auth": [
+            "/auth/me"
+        ],
+        "fiscal": [
+            "/fiscal/xml/resumo",
+            "/fiscal/xml/nota",
+            "/fiscal/xml/download",
+            "/fiscal/regras",
+            "/fiscal/regras/{regra_id}",
+            "/fiscal/regras/{regra_id}/historico",
+            "/fiscal/motor/simular"
         ]
     }
 
@@ -1048,16 +2495,17 @@ def rotas():
 
 @app.post("/sync/tiny-dia")
 def sync_tiny_dia(
-    data: str = Query(..., description="Data no formato YYYY-MM-DD")
+    data: str = Query(..., description="Data no formato YYYY-MM-DD"),
+    filial: str = Query("sp", description="sp ou mg")
 ):
     data_ref = parse_data(data)
-    return sincronizar_periodo(data_ref, data_ref, tipo="dia")
-
+    return sincronizar_periodo(data_ref, data_ref, tipo="dia", filial=filial)
 
 @app.post("/sync/tiny-mes")
 def sync_tiny_mes(
     ano: int = Query(...),
-    mes: int = Query(...)
+    mes: int = Query(...),
+    filial: str = Query("sp", description="sp ou mg")
 ):
     if mes < 1 or mes > 12:
         raise HTTPException(status_code=400, detail="Mês inválido.")
@@ -1066,12 +2514,13 @@ def sync_tiny_mes(
     ultimo_dia = monthrange(ano, mes)[1]
     data_fim = date(ano, mes, ultimo_dia)
 
-    return sincronizar_periodo(data_inicio, data_fim, tipo="mes")
+    return sincronizar_periodo(data_inicio, data_fim, tipo="mes", filial=filial)
 
 
 @app.post("/sync/tiny-ano")
 def sync_tiny_ano(
-    ano: int = Query(...)
+    ano: int = Query(...),
+    filial: str = Query("sp", description="sp ou mg")
 ):
     data_inicio = date(ano, 1, 1)
     data_fim = date(ano, 12, 31)
@@ -1080,11 +2529,14 @@ def sync_tiny_ano(
     if data_fim > hoje:
         data_fim = hoje
 
-    return sincronizar_periodo(data_inicio, data_fim, tipo="ano")
+    return sincronizar_periodo(data_inicio, data_fim, tipo="ano", filial=filial)
 
 
 @app.post("/sync/tiny-periodo")
-def sync_tiny_periodo(body: PeriodoBody):
+def sync_tiny_periodo(
+    body: PeriodoBody,
+    filial: str = Query("sp", description="sp ou mg")
+):
     data_inicio = parse_data(body.data_inicio)
     data_fim = parse_data(body.data_fim)
 
@@ -1094,7 +2546,7 @@ def sync_tiny_periodo(body: PeriodoBody):
             detail="data_fim não pode ser menor que data_inicio."
         )
 
-    return sincronizar_periodo(data_inicio, data_fim, tipo="periodo")
+    return sincronizar_periodo(data_inicio, data_fim, tipo="periodo", filial=filial)
 
 
 @app.post("/sync/descobrir-data-inicial-tiny")
@@ -1301,7 +2753,8 @@ def get_data_inicio_tiny():
 
 def buscar_pedidos_banco_periodo_corrigido(
     data_inicio: date,
-    data_fim: date
+    data_fim: date,
+    filial: str = "sp"
 ) -> List[Dict[str, Any]]:
     validar_env()
 
@@ -1313,6 +2766,7 @@ def buscar_pedidos_banco_periodo_corrigido(
         ("data_pedido", f"lte.{data_fim.isoformat()}"),
         ("order", "data_pedido.asc")
     ]
+    params = adicionar_filtro_filial_params(params, filial)
 
     response = requests.get(
         url,
@@ -1336,9 +2790,12 @@ def buscar_pedidos_banco_periodo_corrigido(
 
 def buscar_itens_banco_periodo_corrigido(
     data_inicio: date,
-    data_fim: date
+    data_fim: date,
+    filial: str = "sp"
 ) -> List[Dict[str, Any]]:
     validar_env()
+
+    filial_normalizada = normalizar_filial(filial)
 
     url = f"{SUPABASE_URL}/rest/v1/itens_pedido"
 
@@ -1348,6 +2805,9 @@ def buscar_itens_banco_periodo_corrigido(
         ("data_pedido", f"lte.{data_fim.isoformat()}"),
         ("order", "data_pedido.asc")
     ]
+
+    if filial_normalizada != "all":
+        params.append(("filial", f"eq.{filial_normalizada}"))
 
     response = requests.get(
         url,
@@ -1362,7 +2822,8 @@ def buscar_itens_banco_periodo_corrigido(
             detail={
                 "erro": "Erro ao consultar itens por período.",
                 "status_code": response.status_code,
-                "resposta": response.text
+                "resposta": response.text,
+                "filial": filial_normalizada
             }
         )
 
@@ -1371,10 +2832,11 @@ def buscar_itens_banco_periodo_corrigido(
 
 def calcular_resumo_periodo_banco(
     data_inicio: date,
-    data_fim: date
+    data_fim: date,
+    filial: str = "sp"
 ) -> Dict[str, Any]:
-    pedidos = buscar_pedidos_banco_periodo_corrigido(data_inicio, data_fim)
-    itens = buscar_itens_banco_periodo_corrigido(data_inicio, data_fim)
+    pedidos = buscar_pedidos_banco_periodo_corrigido(data_inicio, data_fim, filial=filial)
+    itens = buscar_itens_banco_periodo_corrigido(data_inicio, data_fim, filial=filial)
 
     calculado = calcular_resumo_e_ranking(
         pedidos=pedidos,
@@ -1398,8 +2860,11 @@ def calcular_resumo_periodo_banco(
 
 @app.get("/db/resumo-diario")
 def db_resumo_diario(
-    data: Optional[str] = Query(None)
+    data: Optional[str] = Query(None),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     params = {
         "select": "*",
         "order": "data.desc"
@@ -1407,6 +2872,10 @@ def db_resumo_diario(
 
     if data:
         params["data"] = f"eq.{data}"
+
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params["filial"] = f"eq.{filial_normalizada}"
 
     return {
         "status": "ok",
@@ -1417,8 +2886,11 @@ def db_resumo_diario(
 @app.get("/db/resumo-mensal")
 def db_resumo_mensal(
     ano: Optional[int] = Query(None),
-    mes: Optional[int] = Query(None)
+    mes: Optional[int] = Query(None),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     params = {
         "select": "*",
         "order": "ano.desc,mes.desc"
@@ -1430,6 +2902,10 @@ def db_resumo_mensal(
     if mes:
         params["mes"] = f"eq.{mes}"
 
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params["filial"] = f"eq.{filial_normalizada}"
+
     return {
         "status": "ok",
         "dados": supabase_get("resumo_mensal", params)
@@ -1438,8 +2914,11 @@ def db_resumo_mensal(
 
 @app.get("/db/resumo-anual")
 def db_resumo_anual(
-    ano: Optional[int] = Query(None)
+    ano: Optional[int] = Query(None),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     params = {
         "select": "*",
         "order": "ano.desc"
@@ -1448,6 +2927,10 @@ def db_resumo_anual(
     if ano:
         params["ano"] = f"eq.{ano}"
 
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params["filial"] = f"eq.{filial_normalizada}"
+
     return {
         "status": "ok",
         "dados": supabase_get("resumo_anual", params)
@@ -1455,44 +2938,116 @@ def db_resumo_anual(
 
 
 @app.get("/db/dashboard-resumo")
-def db_dashboard_resumo():
+def db_dashboard_resumo(
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    filial = resolver_filial_autorizada(filial, usuario)
     hoje = hoje_br()
     inicio_30 = hoje - timedelta(days=30)
 
+    params_hoje = {
+        "data": f"eq.{hoje.isoformat()}",
+        "select": "*",
+        "limit": "1"
+    }
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params_hoje["filial"] = f"eq.{filial_normalizada}"
+
     resumo_hoje = supabase_get(
         "resumo_diario",
-        {
-            "data": f"eq.{hoje.isoformat()}",
-            "select": "*",
-            "limit": "1"
-        }
+        params_hoje
     )
 
-    resumo_mes = supabase_get(
-        "resumo_mensal",
-        {
-            "ano": f"eq.{hoje.year}",
-            "mes": f"eq.{hoje.month}",
-            "select": "*",
-            "limit": "1"
-        }
+    # Calcula o mês atual diretamente pela soma do resumo_diario.
+    # A tabela resumo_mensal só é atualizada quando /sync/tiny-mes é executado,
+    # então ela pode ficar vazia ou desatualizada durante o mês.
+    inicio_mes = date(hoje.year, hoje.month, 1)
+
+    validar_env()
+    url_mes = f"{SUPABASE_URL}/rest/v1/resumo_diario"
+    params_mes = [
+        ("select", "data_resumo,faturamento_total,total_pedidos,total_unidades_vendidas,total_produtos_diferentes"),
+        ("data_resumo", f"gte.{inicio_mes.isoformat()}"),
+        ("data_resumo", f"lte.{hoje.isoformat()}"),
+        ("order", "data_resumo.asc"),
+        ("limit", "1000"),
+    ]
+    params_mes = adicionar_filtro_filial_params(params_mes, filial)
+
+    resp_mes = requests.get(
+        url_mes,
+        headers=supabase_headers(),
+        params=params_mes,
+        timeout=60
     )
+
+    if resp_mes.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Erro ao calcular o resumo do mês atual.",
+                "status_code": resp_mes.status_code,
+                "resposta": resp_mes.text,
+                "filial": filial_normalizada
+            }
+        )
+
+    registros_mes = resp_mes.json()
+
+    faturamento_mes = round(
+        sum(float(r.get("faturamento_total") or 0) for r in registros_mes),
+        2
+    )
+    total_pedidos_mes = sum(
+        int(r.get("total_pedidos") or 0) for r in registros_mes
+    )
+    total_unidades_mes = round(
+        sum(float(r.get("total_unidades_vendidas") or 0) for r in registros_mes),
+        2
+    )
+    total_produtos_diferentes_mes = sum(
+        int(r.get("total_produtos_diferentes") or 0) for r in registros_mes
+    )
+    ticket_medio_mes = round(
+        faturamento_mes / total_pedidos_mes,
+        2
+    ) if total_pedidos_mes else 0.0
+
+    resumo_mes = {
+        "ano": hoje.year,
+        "mes": hoje.month,
+        "data_inicio": inicio_mes.isoformat(),
+        "data_fim": hoje.isoformat(),
+        "faturamento": faturamento_mes,
+        "faturamento_total": faturamento_mes,
+        "total_pedidos": total_pedidos_mes,
+        "ticket_medio": ticket_medio_mes,
+        "total_unidades_vendidas": total_unidades_mes,
+        "total_produtos_diferentes": total_produtos_diferentes_mes,
+        "filial": filial_normalizada
+    }
+
+    params_logs = {
+        "select": "*",
+        "order": "created_at.desc",
+        "limit": "10"
+    }
+    if filial_normalizada != "all":
+        params_logs["filial"] = f"eq.{filial_normalizada}"
 
     ultimos_logs = supabase_get(
         "sync_logs",
-        {
-            "select": "*",
-            "order": "created_at.desc",
-            "limit": "10"
-        }
+        params_logs
     )
 
-    resumo_30 = calcular_resumo_periodo_banco(inicio_30, hoje)
+    resumo_30 = calcular_resumo_periodo_banco(inicio_30, hoje, filial=filial)
 
     return {
         "status": "ok",
         "hoje": resumo_hoje[0] if resumo_hoje else None,
-        "mes_atual": resumo_mes[0] if resumo_mes else None,
+        "mes_atual": resumo_mes,
         "ultimos_30_dias": resumo_30,
         "sync_logs": ultimos_logs
     }
@@ -1500,26 +3055,36 @@ def db_dashboard_resumo():
 
 @app.get("/db/sync-logs")
 def db_sync_logs(
-    limit: int = Query(20)
+    limit: int = Query(20),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
+    params = {
+        "select": "*",
+        "order": "created_at.desc",
+        "limit": str(limit)
+    }
+
+    filial_normalizada = normalizar_filial(filial)
+    if filial_normalizada != "all":
+        params["filial"] = f"eq.{filial_normalizada}"
+
     return {
         "status": "ok",
-        "dados": supabase_get(
-            "sync_logs",
-            {
-                "select": "*",
-                "order": "created_at.desc",
-                "limit": str(limit)
-            }
-        )
+        "filial": filial_normalizada,
+        "dados": supabase_get("sync_logs", params)
     }
 
 
 @app.get("/db/resumo-periodo")
 def db_resumo_periodo(
     data_inicio: str = Query(..., description="YYYY-MM-DD"),
-    data_fim: str = Query(..., description="YYYY-MM-DD")
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     inicio = parse_data(data_inicio)
     fim = parse_data(data_fim)
 
@@ -1555,6 +3120,7 @@ def db_resumo_periodo(
         ("order", "data_resumo.asc"),
         ("limit", "1000"),
     ]
+    params = adicionar_filtro_filial_params(params, filial)
     resp = requests.get(url, headers=supabase_headers(), params=params, timeout=60)
     if resp.status_code >= 400:
         raise HTTPException(
@@ -1603,8 +3169,11 @@ def db_resumo_periodo(
 def db_ranking_periodo(
     data_inicio: str = Query(..., description="YYYY-MM-DD"),
     data_fim: str = Query(..., description="YYYY-MM-DD"),
-    limite: int = Query(10)
+    limite: int = Query(10),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     inicio = parse_data(data_inicio)
     fim = parse_data(data_fim)
 
@@ -1614,8 +3183,8 @@ def db_ranking_periodo(
             detail="data_fim não pode ser menor que data_inicio."
         )
 
-    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim)
-    itens = buscar_itens_banco_periodo_corrigido(inicio, fim)
+    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim, filial=filial)
+    itens = buscar_itens_banco_periodo_corrigido(inicio, fim, filial=filial)
 
     calculado = calcular_resumo_e_ranking(
         pedidos=pedidos,
@@ -1636,8 +3205,11 @@ def db_ranking_periodo(
 @app.get("/db/faturamento-canais")
 def db_faturamento_canais(
     data_inicio: str = Query(..., description="YYYY-MM-DD"),
-    data_fim: str = Query(..., description="YYYY-MM-DD")
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
 ):
+    filial = resolver_filial_autorizada(filial, usuario)
     inicio = parse_data(data_inicio)
     fim = parse_data(data_fim)
 
@@ -1647,7 +3219,7 @@ def db_faturamento_canais(
             detail="data_fim não pode ser menor que data_inicio."
         )
 
-    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim)
+    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim, filial=filial)
 
     resultado = {
         "PDV": {
@@ -1690,10 +3262,310 @@ def db_faturamento_canais(
         "status": "ok",
         "data_inicio": inicio.isoformat(),
         "data_fim": fim.isoformat(),
+        "filial": normalizar_filial(filial),
         "pdv": resultado["PDV"],
         "comercial": resultado["COMERCIAL"],
         "total": total
     }
+
+
+
+@app.get("/db/faturamento-origens")
+def db_faturamento_origens(
+    data_inicio: str = Query(..., description="YYYY-MM-DD"),
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: Optional[str] = Query(None, description="sp, mg ou all"),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual)
+):
+    filial = resolver_filial_autorizada(filial, usuario)
+    inicio = parse_data(data_inicio)
+    fim = parse_data(data_fim)
+
+    if fim < inicio:
+        raise HTTPException(status_code=400, detail="data_fim não pode ser menor que data_inicio.")
+
+    pedidos = buscar_pedidos_banco_periodo_corrigido(inicio, fim, filial=filial)
+    agrupado: Dict[str, Dict[str, Any]] = {}
+
+    for pedido in pedidos:
+        origem = safe_str(pedido.get("origem_cliente") or "Sem origem").strip() or "Sem origem"
+        canal = safe_str(pedido.get("canal_venda") or "COMERCIAL").upper().strip()
+        if canal not in ["PDV", "COMERCIAL"]:
+            canal = "COMERCIAL"
+
+        valor = float(pedido.get("valor_total") or 0)
+
+        if origem not in agrupado:
+            agrupado[origem] = {
+                "origem": origem,
+                "pedidos": 0,
+                "faturamento": 0.0,
+                "ticket_medio": 0.0,
+                "percentual_pedidos": 0.0,
+                "percentual_faturamento": 0.0,
+                "pdv": {"pedidos": 0, "faturamento": 0.0, "ticket_medio": 0.0},
+                "comercial": {"pedidos": 0, "faturamento": 0.0, "ticket_medio": 0.0}
+            }
+
+        item = agrupado[origem]
+        item["pedidos"] += 1
+        item["faturamento"] += valor
+
+        chave_canal = "pdv" if canal == "PDV" else "comercial"
+        item[chave_canal]["pedidos"] += 1
+        item[chave_canal]["faturamento"] += valor
+
+    total_pedidos = sum(item["pedidos"] for item in agrupado.values())
+    total_faturamento = round(sum(item["faturamento"] for item in agrupado.values()), 2)
+
+    origens = []
+    for item in agrupado.values():
+        pedidos_origem = item["pedidos"]
+        faturamento_origem = item["faturamento"]
+
+        item["faturamento"] = round(faturamento_origem, 2)
+        item["ticket_medio"] = round(faturamento_origem / pedidos_origem, 2) if pedidos_origem else 0.0
+        item["percentual_pedidos"] = round(pedidos_origem / total_pedidos * 100, 2) if total_pedidos else 0.0
+        item["percentual_faturamento"] = round(faturamento_origem / total_faturamento * 100, 2) if total_faturamento else 0.0
+
+        for chave in ["pdv", "comercial"]:
+            qtd = item[chave]["pedidos"]
+            fat = item[chave]["faturamento"]
+            item[chave]["faturamento"] = round(fat, 2)
+            item[chave]["ticket_medio"] = round(fat / qtd, 2) if qtd else 0.0
+
+        origens.append(item)
+
+    origens.sort(key=lambda item: item["faturamento"], reverse=True)
+
+    sem_origem = next(
+        (item for item in origens if item["origem"] == "Sem origem"),
+        {"pedidos": 0, "faturamento": 0.0}
+    )
+
+    maior_ticket = max(origens, key=lambda item: item["ticket_medio"])["origem"] if origens else None
+
+    return {
+        "status": "ok",
+        "data_inicio": inicio.isoformat(),
+        "data_fim": fim.isoformat(),
+        "filial": normalizar_filial(filial),
+        "total": {
+            "pedidos": total_pedidos,
+            "faturamento": total_faturamento,
+            "ticket_medio": round(total_faturamento / total_pedidos, 2) if total_pedidos else 0.0
+        },
+        "destaques": {
+            "principal_origem": origens[0]["origem"] if origens else None,
+            "maior_ticket_medio": maior_ticket,
+            "pedidos_sem_origem": sem_origem["pedidos"],
+            "faturamento_sem_origem": sem_origem["faturamento"]
+        },
+        "origens": origens
+    }
+
+
+
+# ============================================================
+# ROTAS FISCAIS — NF-e, NFC-e E XML
+# ============================================================
+
+@app.get("/fiscal/xml/resumo")
+def fiscal_xml_resumo(
+    data_inicio: str = Query(..., description="YYYY-MM-DD"),
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    incluir_notas: bool = Query(False, description="Inclui a lista de notas no retorno."),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual),
+):
+    filial_resolvida = resolver_filial_autorizada(filial, usuario, permitir_all=False)
+    inicio = parse_data(data_inicio)
+    fim = parse_data(data_fim)
+
+    if fim < inicio:
+        raise HTTPException(status_code=400, detail="data_fim não pode ser menor que data_inicio.")
+
+    if (fim - inicio).days > 366:
+        raise HTTPException(status_code=400, detail="O período fiscal máximo é de 367 dias.")
+
+    notas = buscar_notas_fiscais_periodo_tiny(
+        inicio,
+        fim,
+        filial=filial_resolvida,
+    )
+    resumo = resumir_notas_fiscais(notas)
+
+    resposta: Dict[str, Any] = {
+        "status": "ok",
+        "filial": filial_resolvida,
+        "data_inicio": inicio.isoformat(),
+        "data_fim": fim.isoformat(),
+        **resumo,
+    }
+
+    if incluir_notas:
+        resposta["notas"] = notas
+
+    return resposta
+
+
+@app.get("/fiscal/xml/nota")
+def fiscal_xml_nota(
+    id_nota: str = Query(..., min_length=1, description="ID interno da nota fiscal no Tiny/Olist."),
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    incluir_cancelamento: bool = Query(False),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual),
+):
+    filial_resolvida = resolver_filial_autorizada(filial, usuario, permitir_all=False)
+    resultado = obter_xml_nota_fiscal_tiny(id_nota, filial=filial_resolvida)
+
+    if incluir_cancelamento and resultado.get("xml_cancelamento"):
+        conteudo = resultado["xml_cancelamento"] or ""
+        sufixo = "cancelamento"
+    else:
+        conteudo = resultado["xml_nfe"] or ""
+        sufixo = "nfe"
+
+    nome = f"xml_{nome_seguro_arquivo(id_nota)}_{sufixo}.xml"
+    return Response(
+        content=conteudo.encode("utf-8"),
+        media_type="application/xml; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{nome}"'},
+    )
+
+
+@app.get("/fiscal/xml/download")
+def fiscal_xml_download(
+    data_inicio: str = Query(..., description="YYYY-MM-DD"),
+    data_fim: str = Query(..., description="YYYY-MM-DD"),
+    filial: Optional[str] = Query(None, description="sp ou mg"),
+    tipo: str = Query("ambos", description="nfe, nfce ou ambos"),
+    limite: int = Query(500, ge=1, le=2000, description="Máximo de XMLs neste ZIP."),
+    incluir_cancelamentos: bool = Query(True),
+    usuario: Dict[str, Any] = Depends(obter_usuario_atual),
+):
+    filial_resolvida = resolver_filial_autorizada(filial, usuario, permitir_all=False)
+    inicio = parse_data(data_inicio)
+    fim = parse_data(data_fim)
+    tipo_normalizado = safe_str(tipo).lower().strip()
+
+    if fim < inicio:
+        raise HTTPException(status_code=400, detail="data_fim não pode ser menor que data_inicio.")
+    if tipo_normalizado not in ["nfe", "nfce", "ambos"]:
+        raise HTTPException(status_code=400, detail="tipo deve ser nfe, nfce ou ambos.")
+    if (fim - inicio).days > 92:
+        raise HTTPException(
+            status_code=400,
+            detail="Para download em ZIP, selecione no máximo 93 dias por operação.",
+        )
+
+    notas = buscar_notas_fiscais_periodo_tiny(
+        inicio,
+        fim,
+        filial=filial_resolvida,
+    )
+
+    notas_filtradas = []
+    for nota in notas:
+        modelo = modelo_nota_pela_chave(nota.get("chave_acesso"))
+        if tipo_normalizado == "ambos" and modelo in ["nfe", "nfce"]:
+            notas_filtradas.append(nota)
+        elif modelo == tipo_normalizado:
+            notas_filtradas.append(nota)
+
+    total_encontrado = len(notas_filtradas)
+    notas_processadas = notas_filtradas[:limite]
+
+    buffer = io.BytesIO()
+    erros: List[Dict[str, Any]] = []
+    baixados = 0
+
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as arquivo_zip:
+        for indice, nota in enumerate(notas_processadas, start=1):
+            id_nota = safe_str(nota.get("id")).strip()
+            modelo = modelo_nota_pela_chave(nota.get("chave_acesso"))
+            pasta = "NFE" if modelo == "nfe" else "NFCE"
+
+            if not id_nota:
+                erros.append({"id": None, "numero": nota.get("numero"), "erro": "Nota sem ID interno."})
+                continue
+
+            try:
+                xmls = obter_xml_nota_fiscal_tiny(id_nota, filial=filial_resolvida)
+                numero = nome_seguro_arquivo(nota.get("numero"), id_nota)
+                serie = nome_seguro_arquivo(nota.get("serie"), "sem_serie")
+                chave = nome_seguro_arquivo(nota.get("chave_acesso"), id_nota)
+                nome_base = f"{numero}_serie_{serie}_{chave}"
+
+                arquivo_zip.writestr(
+                    f"{pasta}/{nome_base}.xml",
+                    (xmls.get("xml_nfe") or "").encode("utf-8"),
+                )
+                baixados += 1
+
+                if incluir_cancelamentos and xmls.get("xml_cancelamento"):
+                    arquivo_zip.writestr(
+                        f"{pasta}/CANCELAMENTOS/{nome_base}_cancelamento.xml",
+                        (xmls.get("xml_cancelamento") or "").encode("utf-8"),
+                    )
+
+            except HTTPException as exc:
+                erros.append({
+                    "id": id_nota,
+                    "numero": nota.get("numero"),
+                    "erro": exc.detail,
+                })
+            except Exception as exc:
+                erros.append({
+                    "id": id_nota,
+                    "numero": nota.get("numero"),
+                    "erro": str(exc),
+                })
+
+            # Pequena pausa reduz bloqueios da API 2.0 em downloads grandes.
+            if indice < len(notas_processadas):
+                time.sleep(0.25)
+
+        manifesto = {
+            "filial": filial_resolvida,
+            "data_inicio": inicio.isoformat(),
+            "data_fim": fim.isoformat(),
+            "tipo": tipo_normalizado,
+            "total_encontrado": total_encontrado,
+            "limite_solicitado": limite,
+            "total_processado": len(notas_processadas),
+            "xmls_baixados": baixados,
+            "erros": len(erros),
+            "download_parcial": total_encontrado > limite,
+            "gerado_em": datetime.now().isoformat(),
+        }
+        arquivo_zip.writestr(
+            "manifesto.json",
+            json.dumps(manifesto, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        if erros:
+            arquivo_zip.writestr(
+                "erros.json",
+                json.dumps(erros, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+            )
+
+    buffer.seek(0)
+    nome_zip = (
+        f"xml_{filial_resolvida}_{tipo_normalizado}_"
+        f"{inicio.isoformat()}_{fim.isoformat()}.zip"
+    )
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{nome_zip}"',
+            "X-XML-Encontrados": str(total_encontrado),
+            "X-XML-Baixados": str(baixados),
+            "X-XML-Erros": str(len(erros)),
+            "X-Download-Parcial": "true" if total_encontrado > limite else "false",
+        },
+    )
 
 
 # ============================================================
