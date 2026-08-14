@@ -368,6 +368,25 @@ def dedupe(items: list[dict]) -> list[dict]:
     return out
 
 
+
+def filtrar_relevancia_pos_ia(items):
+    """Remove do Radar notícias classificadas pela IA como neutras."""
+    mantidos = []
+    descartados = 0
+    for item in items:
+        relevancia = str(item.get("relevancia") or "").strip().lower()
+        if relevancia == "neutra":
+            descartados += 1
+            continue
+        mantidos.append(item)
+    log.info(
+        "Pós-filtro IA: %d mantidos, %d neutros descartados",
+        len(mantidos),
+        descartados,
+    )
+    return mantidos
+
+
 def run(days: int = 7, debug: bool = False, disable_llm: bool = False) -> dict[str, Any]:
     now = datetime.now().isoformat()
     raw = []
@@ -379,6 +398,7 @@ def run(days: int = 7, debug: bool = False, disable_llm: bool = False) -> dict[s
     items = filtrar_ruido_pre_ia(items)
     if not disable_llm:
         items = _batch(items)
+        items = filtrar_relevancia_pos_ia(items)
     return {
         "gerado_em": now,
         "periodo_dias": days,
