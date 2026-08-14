@@ -20,7 +20,7 @@ from typing import Any, Optional
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("lumina-radar")
+log = logging.getLogger("lumino-radar")
 
 # ---------------------------------------------------------------------------
 # Configuração global
@@ -276,6 +276,86 @@ def _batch(items: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Agregação e dedupe
 # ---------------------------------------------------------------------------
+
+def _normalizar_texto_filtro(valor):
+    return re.sub(r"\s+", " ", str(valor or "")).strip().lower()
+
+
+def _deve_descartar_antes_da_ia(item):
+    """
+    Remove ruído óbvio antes de consumir tokens da OpenAI.
+    Só descarta itens claramente administrativos, vazios ou sem
+    conteúdo tributário útil.
+    """
+    titulo = _normalizar_texto_filtro(item.get("titulo"))
+    resumo = _normalizar_texto_filtro(item.get("resumo_original"))
+    texto = _normalizar_texto_filtro(item.get("texto_completo"))
+    link = _normalizar_texto_filtro(item.get("link"))
+    combinado = f"{titulo} {resumo} {texto} {link}"
+
+    if any(x in combinado for x in [
+        "pagina em construcao",
+        "página em construção",
+        "em construcao",
+        "em construção",
+    ]):
+        return True
+
+    if any(x in combinado for x in [
+        "aviso de contratacao direta",
+        "aviso de contratação direta",
+        "licitacao",
+        "licitação",
+        "pregao",
+        "pregão",
+        "pncp",
+        "portal nacional de contratacoes publicas",
+        "portal nacional de contratações públicas",
+        "dispensa de licitacao",
+        "dispensa de licitação",
+        "concorrencia eletronica",
+        "concorrência eletrônica",
+        "empreitada global",
+    ]):
+        return True
+
+    apenas_nome_pdf = (
+        titulo.endswith(".pdf")
+        and not resumo
+        and texto == titulo
+    )
+
+    if apenas_nome_pdf:
+        palavras_tributarias = [
+            "icms", "ipi", "pis", "cofins", "simples nacional", "ncm",
+            "cest", "cfop", "reforma tributaria", "reforma tributária",
+            "cbs", "ibs", "tribut", "fiscal", "aliquota", "alíquota",
+            "substituicao tributaria", "substituição tributária",
+        ]
+        if not any(p in combinado for p in palavras_tributarias):
+            return True
+
+    return False
+
+
+def filtrar_ruido_pre_ia(items):
+    mantidos = []
+    descartados = 0
+
+    for item in items:
+        if _deve_descartar_antes_da_ia(item):
+            descartados += 1
+            continue
+        mantidos.append(item)
+
+    log.info(
+        "Pré-filtro IA: %d mantidos, %d descartados",
+        len(mantidos),
+        descartados,
+    )
+    return mantidos
+
+
 def dedupe(items: list[dict]) -> list[dict]:
     seen, out = set(), []
     for it in items:
@@ -296,6 +376,7 @@ def run(days: int = 7, debug: bool = False, disable_llm: bool = False) -> dict[s
     raw += collect_dou(days=days, debug=debug)
     log.info("Total bruto coletado: %d itens", len(raw))
     items = dedupe(raw)
+    items = filtrar_ruido_pre_ia(items)
     if not disable_llm:
         items = _batch(items)
     return {
