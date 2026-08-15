@@ -206,43 +206,28 @@ def _batch(items: list[dict]) -> list[dict]:
     SYSTEM = (
         "Você é o analista tributário do LÚMINO. Analise notícias oficiais pensando em uma "
         "empresa brasileira de COMÉRCIO DE MERCADORIAS e E-COMMERCE, atualmente optante pelo "
-        "Simples Nacional. O objetivo não é montar um feed tributário genérico, mas detectar "
-        "mudanças com potencial de afetar vendas, emissão fiscal, cadastro de produtos, preço, "
-        "margem, obrigações acessórias ou tributação de mercadorias. "
+        "Simples Nacional. O objetivo é detectar mudanças com potencial de afetar vendas, emissão "
+        "fiscal, cadastro de produtos, preço, margem, obrigações acessórias ou tributação. "
 
-        "REGRAS DE RELEVÂNCIA: "
-        "Marque 'alta' somente quando houver mudança concreta, obrigação, prazo ou regra com "
-        "efeito direto ou muito provável sobre comércio/e-commerce/Simples Nacional, especialmente "
-        "ICMS, ICMS-ST, DIFAL, FCP, IPI, PIS/COFINS, CBS, IBS, NCM, CEST, CFOP, NF-e, SPED, "
-        "documentos fiscais ou Reforma Tributária aplicável a empresas/comércio. "
-        "Marque 'media' quando a mudança puder afetar comércio/e-commerce, mas depender de setor, "
-        "produto, UF, vigência ou regulamentação complementar. "
-        "Marque 'neutra' quando o conteúdo não tiver efeito prático para comércio de mercadorias/e-commerce. "
+        "Classifique como 'alta' mudanças concretas ou obrigatórias com efeito direto sobre comércio, "
+        "e-commerce ou Simples Nacional. Classifique como 'media' mudanças potencialmente relevantes "
+        "que dependam de setor, produto, UF, vigência ou regulamentação complementar. Use 'neutra' para "
+        "assuntos sem efeito prático para a empresa. "
 
-        "LICITAÇÕES E COMPRAS PÚBLICAS: editais, licitações, pregões, habilitação, contratos "
-        "administrativos, PNCP e compras públicas devem ser SEMPRE classificados como 'neutra' "
-        "neste Radar geral, mesmo quando citarem Simples Nacional, retenção ou documentação fiscal. "
+        "Licitações, editais, pregões, habilitação, contratos administrativos, PNCP e compras públicas "
+        "devem ser 'neutra' neste Radar geral. ITBI, IPTU, previdência pública, temas atuariais, ISS de "
+        "clínicas/profissões alheias e obras públicas também devem ser 'neutra' quando não houver relação "
+        "direta com comércio de mercadorias/e-commerce. "
 
-        "Também devem ser neutras, salvo relação direta e explícita com a operação comercial: "
-        "ITBI, IPTU, previdência de servidor ou ente público, contribuição atuarial, ISS de clínicas, "
-        "profissões ou serviços alheios, obras públicas, tributos imobiliários locais e alterações "
-        "municipais sem relação com venda de mercadorias. "
+        "IMPORTANTE: notícias oficiais da Receita Federal podem chegar pelo RSS apenas com o título. "
+        "Se o título oficial indicar claramente mudança relevante em Simples Nacional, regime de caixa, "
+        "NFS-e, NF-e, Reforma Tributária, CBS, IBS, ICMS, IPI, PIS, COFINS, NCM, CEST, CFOP ou SPED, "
+        "NÃO classifique como neutra apenas porque o texto é curto. Faça análise conservadora baseada "
+        "somente no que o título afirma, sem inventar detalhes. "
 
-        "CONTEÚDO INSUFICIENTE: se o texto disponível for apenas um título, nome de página, nome de PDF "
-        "ou trecho curto demais para comprovar a mudança, NÃO invente detalhes de ICMS, CFOP, NF-e, ST, "
-        "prazo ou obrigação. Quando não houver base suficiente para um impacto empresarial objetivo, "
-        "classifique como 'neutra'. EXCEÇÃO: títulos oficiais da Receita Federal que indiquem claramente "
-        "mudança tributária objetiva, como Simples Nacional, regime de caixa, NFS-e, NF-e, reforma tributária "
-        "ou tributos empresariais, podem ser classificados por relevância com impacto conservador, sem inventar detalhes. "
-
-        "NCMs: preencha 'ncms_afetados' SOMENTE quando a própria notícia ou norma mencionar um NCM "
-        "específico de 8 dígitos ou quando o texto trouxer uma classificação fiscal inequívoca que permita "
-        "identificar o NCM sem adivinhação. Normalize cada NCM para exatamente 8 dígitos, sem pontos. "
-        "NUNCA invente, estime ou deduza NCM apenas pelo setor, nome genérico de produto ou contexto. "
-        "Se não houver base explícita suficiente, retorne ncms_afetados como lista vazia. "
-
-        "No campo impacto, explique objetivamente o efeito empresarial. No resumo, descreva a mudança "
-        "sem extrapolar o texto oficial. Use tags curtas e úteis."
+        "NCMs: preencha 'ncms_afetados' SOMENTE quando a notícia ou norma mencionar NCM específico de "
+        "8 dígitos ou classificação fiscal inequívoca. Nunca invente ou estime NCM. Se não houver base "
+        "explícita, retorne lista vazia. "
     )
     schema = {
         "type": "json_schema",
@@ -404,8 +389,8 @@ def dedupe(items: list[dict]) -> list[dict]:
 
 def filtrar_relevancia_pos_ia(items):
     """
-    Remove notícias neutras e ruídos tributários sem relação prática
-    com comércio de mercadorias/e-commerce.
+    Remove ruído, mas preserva notícias oficiais da Receita Federal cujo título
+    já revela tema tributário claramente relevante, mesmo se a IA marcar neutra.
     """
     mantidos = []
     descartados = 0
@@ -417,32 +402,22 @@ def filtrar_relevancia_pos_ia(items):
         "pncp", "compras públicas", "compras publicas",
     ]
 
+    termos_fortes_receita = [
+        "simples nacional", "regime de caixa", "nfs-e", "nf-e",
+        "reforma tributária", "reforma tributaria", "cbs", "ibs",
+        "icms", "ipi", "pis", "cofins", "ncm", "cest", "cfop", "sped",
+    ]
+
     termos_ruido_forte = [
         "itbi", "iptu", "previdência", "previdencia", "atuarial",
         "terapia multidisciplinar", "clínica", "clinica", "servidores",
         "fundo em repartição", "fundo em reparticao",
     ]
 
-    termos_comercio = [
-        "icms", "icms-st", "substituição tributária", "substituicao tributaria",
-        "difal", "fcp", "ipi", "pis", "cofins", "cbs", "ibs", "ncm", "cest",
-        "cfop", "nf-e", "nfs-e", "nota fiscal", "sped", "simples nacional",
-        "reforma tributária", "reforma tributaria", "mercadoria", "produto",
-        "comércio", "comercio", "e-commerce", "venda", "das",
-        "regime de caixa", "apuração", "apuracao",
-    ]
-
-    termos_fortes_titulo_oficial = [
-        "simples nacional", "regime de caixa", "nfs-e", "nf-e",
-        "reforma tributária", "reforma tributaria", "cbs", "ibs",
-        "icms", "ipi", "pis", "cofins", "ncm", "cest", "cfop", "sped",
-    ]
-
     for item in items:
+        titulo = _normalizar_texto_filtro(item.get("titulo"))
+        fonte = _normalizar_texto_filtro(item.get("fonte"))
         relevancia = str(item.get("relevancia") or "").strip().lower()
-        if relevancia == "neutra":
-            descartados += 1
-            continue
 
         combinado = _normalizar_texto_filtro(
             " ".join([
@@ -459,28 +434,31 @@ def filtrar_relevancia_pos_ia(items):
             descartados += 1
             continue
 
-        tem_ruido_forte = any(t in combinado for t in termos_ruido_forte)
-        tem_contexto_comercio = any(t in combinado for t in termos_comercio)
-        if tem_ruido_forte and not tem_contexto_comercio:
+        # Regra de segurança: uma manchete oficial da Receita com tema forte
+        # não pode desaparecer só porque a IA marcou neutra por falta de texto.
+        receita_tema_forte = (
+            fonte == "receita_federal_rss"
+            and any(t in titulo for t in termos_fortes_receita)
+        )
+
+        if receita_tema_forte:
+            if relevancia == "neutra":
+                item["relevancia"] = "media"
+                if not item.get("impacto") or item.get("impacto") == "informativo":
+                    item["impacto"] = (
+                        "Tema tributário oficial potencialmente relevante para comércio/e-commerce. "
+                        "Validar a norma completa antes de executar qualquer alteração fiscal."
+                    )
+            mantidos.append(item)
+            continue
+
+        if relevancia == "neutra":
             descartados += 1
             continue
 
-        texto_original = _normalizar_texto_filtro(item.get("texto_completo"))
-        titulo = _normalizar_texto_filtro(item.get("titulo"))
-        resumo_original = _normalizar_texto_filtro(item.get("resumo_original"))
-        fonte = _normalizar_texto_filtro(item.get("fonte"))
-
-        conteudo_curto = (
-            not resumo_original
-            and (texto_original == titulo or len(texto_original) < 120)
-        )
-
-        if conteudo_curto:
-            eh_receita_oficial = fonte == "receita_federal_rss"
-            titulo_tem_tema_forte = any(t in titulo for t in termos_fortes_titulo_oficial)
-            if not (eh_receita_oficial and titulo_tem_tema_forte):
-                descartados += 1
-                continue
+        if any(t in combinado for t in termos_ruido_forte):
+            descartados += 1
+            continue
 
         mantidos.append(item)
 
