@@ -15,7 +15,7 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import requests
 
@@ -187,6 +187,91 @@ def collect_dou(days: int = 7, limit: int = 40, debug: bool = False) -> list[dic
 
 
 # ---------------------------------------------------------------------------
+# Monitoramento dedicado por NCM — DOU
+# ---------------------------------------------------------------------------
+def collect_dou_ncms(
+    ncms: Sequence[str],
+    days: int = 30,
+    limit_per_ncm: int = 2,
+    debug: bool = False,
+) -> list[dict]:
+    """
+    Procura menções EXATAS aos NCMs monitorados no DOU (Seção 1).
+
+    Observação:
+    - usa apenas NCMs válidos de 8 dígitos;
+    - consulta um NCM por vez para evitar falsos positivos;
+    - limita resultados por NCM para controlar tempo/custo;
+    - os itens passam pela mesma IA e pelos mesmos filtros do Radar.
+    """
+    itens: list[dict] = []
+    frm = (date.today() - timedelta(days=days)).strftime("%d-%m-%Y")
+    to = date.today().strftime("%d-%m-%Y")
+
+    ncms_validos: list[str] = []
+    seen_ncms: set[str] = set()
+    for valor in ncms:
+        ncm = re.sub(r"\D", "", str(valor or ""))
+        if len(ncm) != 8 or ncm in seen_ncms:
+            continue
+        seen_ncms.add(ncm)
+        ncms_validos.append(ncm)
+
+    for ncm in ncms_validos:
+        try:
+            html = _dou_fetch_html(f'"{ncm}"', frm, to)
+        except Exception as exc:
+            log.warning("DOU/NCM falhou para %s: %s", ncm, exc)
+            continue
+
+        if not html:
+            continue
+
+        try:
+            m = re.search(r'BuscaDouPortlet_params[^>]*>(.*?)</script>', html, re.S)
+            if not m:
+                continue
+
+            data = json.loads(m.group(1))
+            encontrados = 0
+
+            for c in data.get("jsonArray", []):
+                titulo = c.get("title", "")
+                conteudo = re.sub(r"<[^>]+>", "", c.get("content", ""))
+                combinado = f"{titulo} {conteudo}"
+
+                # Só mantém quando o NCM realmente aparece no conteúdo/título.
+                if ncm not in re.sub(r"\D", "", combinado):
+                    continue
+
+                itens.append({
+                    "fonte": "dou_ncm_monitorado",
+                    "titulo": titulo or f"Menção ao NCM {ncm} no DOU",
+                    "resumo_original": conteudo[:1500],
+                    "link": DOU_WEB + c.get("urlTitle", ""),
+                    "data": c.get("pubDate", ""),
+                    "texto_completo": conteudo,
+                    "ncm_monitorado": ncm,
+                })
+                encontrados += 1
+
+                if encontrados >= limit_per_ncm:
+                    break
+
+        except Exception as exc:
+            log.warning("Parse DOU/NCM falhou para %s: %s", ncm, exc)
+
+    if debug:
+        log.info(
+            "DOU/NCM: %d itens encontrados para %d NCMs monitorados",
+            len(itens),
+            len(ncms_validos),
+        )
+
+    return itens
+
+
+# ---------------------------------------------------------------------------
 # Camada de Inteligência — classificação e resumo via LLM
 # ---------------------------------------------------------------------------
 def _batch(items: list[dict]) -> list[dict]:
@@ -266,7 +351,15 @@ def _batch(items: list[dict]) -> list[dict]:
         batch = items[i:i + batch_size]
         user_parts = []
         for idx, it in enumerate(batch):
-            user_parts.append(f"[{idx}] Título: {it['titulo']}\nData: {it['data']}\nFonte: {it['fonte']}\nTexto: {it['texto_completo'][:800]}")
+            contexto_ncm = (
+                f"\nNCM monitorado: {it.get('ncm_monitorado')}"
+                if it.get("ncm_monitorado")
+                else ""
+            )
+            user_parts.append(
+                f"[{idx}] Título: {it['titulo']}\nData: {it['data']}\nFonte: {it['fonte']}"
+                f"{contexto_ncm}\nTexto: {it['texto_completo'][:800]}"
+            )
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
@@ -287,6 +380,17 @@ def _batch(items: list[dict]) -> list[dict]:
                     "tags": a["tags"],
                     "ncms_afetados": a["ncms_afetados"],
                 })
+
+                ncm_monitorado = re.sub(r"\D", "", str(b.get("ncm_monitorado") or ""))
+                if len(ncm_monitorado) == 8:
+                    ncms = {
+                        re.sub(r"\D", "", str(v or ""))
+                        for v in b.get("ncms_afetados", [])
+                    }
+                    ncms = {v for v in ncms if len(v) == 8}
+                    ncms.add(ncm_monitorado)
+                    b["ncms_afetados"] = sorted(ncms)
+
                 out.append(b)
     return out
 
@@ -470,12 +574,33 @@ def filtrar_relevancia_pos_ia(items):
     return mantidos
 
 
-def run(days: int = 7, debug: bool = False, disable_llm: bool = False) -> dict[str, Any]:
+def run(
+    days: int = 7,
+    debug: bool = False,
+    disable_llm: bool = False,
+    ncm_watchlist: Optional[Sequence[str]] = None,
+    ncm_days: int = 30,
+) -> dict[str, Any]:
     now = datetime.now().isoformat()
     raw = []
     raw += collect_rss(days=days, debug=debug)
     raw += collect_querido_diario(days=days, debug=debug)
     raw += collect_dou(days=days, debug=debug)
+
+    if ncm_watchlist:
+        itens_ncm = collect_dou_ncms(
+            ncm_watchlist,
+            days=ncm_days,
+            limit_per_ncm=2,
+            debug=debug,
+        )
+        raw += itens_ncm
+        log.info(
+            "Monitoramento NCM: %d itens adicionais para %d NCMs",
+            len(itens_ncm),
+            len(list(ncm_watchlist)),
+        )
+
     log.info("Total bruto coletado: %d itens", len(raw))
     items = dedupe(raw)
     items = filtrar_ruido_pre_ia(items)
