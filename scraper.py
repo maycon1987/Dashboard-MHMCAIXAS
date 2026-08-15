@@ -231,7 +231,9 @@ def _batch(items: list[dict]) -> list[dict]:
         "CONTEÚDO INSUFICIENTE: se o texto disponível for apenas um título, nome de página, nome de PDF "
         "ou trecho curto demais para comprovar a mudança, NÃO invente detalhes de ICMS, CFOP, NF-e, ST, "
         "prazo ou obrigação. Quando não houver base suficiente para um impacto empresarial objetivo, "
-        "classifique como 'neutra'. "
+        "classifique como 'neutra'. EXCEÇÃO: títulos oficiais da Receita Federal que indiquem claramente "
+        "mudança tributária objetiva, como Simples Nacional, regime de caixa, NFS-e, NF-e, reforma tributária "
+        "ou tributos empresariais, podem ser classificados por relevância com impacto conservador, sem inventar detalhes. "
 
         "NCMs: preencha 'ncms_afetados' SOMENTE quando a própria notícia ou norma mencionar um NCM "
         "específico de 8 dígitos ou quando o texto trouxer uma classificação fiscal inequívoca que permita "
@@ -409,46 +411,35 @@ def filtrar_relevancia_pos_ia(items):
     descartados = 0
 
     termos_descartar_sempre = [
-        "licitação",
-        "licitacao",
-        "edital",
-        "pregão",
-        "pregao",
-        "contratação pública",
-        "contratacao publica",
-        "contrato administrativo",
-        "habilitação",
-        "habilitacao",
-        "pncp",
-        "compras públicas",
-        "compras publicas",
+        "licitação", "licitacao", "edital", "pregão", "pregao",
+        "contratação pública", "contratacao publica",
+        "contrato administrativo", "habilitação", "habilitacao",
+        "pncp", "compras públicas", "compras publicas",
     ]
 
     termos_ruido_forte = [
-        "itbi",
-        "iptu",
-        "previdência",
-        "previdencia",
-        "atuarial",
-        "terapia multidisciplinar",
-        "clínica",
-        "clinica",
-        "servidores",
-        "fundo em repartição",
-        "fundo em reparticao",
+        "itbi", "iptu", "previdência", "previdencia", "atuarial",
+        "terapia multidisciplinar", "clínica", "clinica", "servidores",
+        "fundo em repartição", "fundo em reparticao",
     ]
 
     termos_comercio = [
         "icms", "icms-st", "substituição tributária", "substituicao tributaria",
         "difal", "fcp", "ipi", "pis", "cofins", "cbs", "ibs", "ncm", "cest",
-        "cfop", "nf-e", "nota fiscal", "sped", "simples nacional",
+        "cfop", "nf-e", "nfs-e", "nota fiscal", "sped", "simples nacional",
         "reforma tributária", "reforma tributaria", "mercadoria", "produto",
-        "comércio", "comercio", "e-commerce", "venda",
+        "comércio", "comercio", "e-commerce", "venda", "das",
+        "regime de caixa", "apuração", "apuracao",
+    ]
+
+    termos_fortes_titulo_oficial = [
+        "simples nacional", "regime de caixa", "nfs-e", "nf-e",
+        "reforma tributária", "reforma tributaria", "cbs", "ibs",
+        "icms", "ipi", "pis", "cofins", "ncm", "cest", "cfop", "sped",
     ]
 
     for item in items:
         relevancia = str(item.get("relevancia") or "").strip().lower()
-
         if relevancia == "neutra":
             descartados += 1
             continue
@@ -470,7 +461,6 @@ def filtrar_relevancia_pos_ia(items):
 
         tem_ruido_forte = any(t in combinado for t in termos_ruido_forte)
         tem_contexto_comercio = any(t in combinado for t in termos_comercio)
-
         if tem_ruido_forte and not tem_contexto_comercio:
             descartados += 1
             continue
@@ -478,18 +468,19 @@ def filtrar_relevancia_pos_ia(items):
         texto_original = _normalizar_texto_filtro(item.get("texto_completo"))
         titulo = _normalizar_texto_filtro(item.get("titulo"))
         resumo_original = _normalizar_texto_filtro(item.get("resumo_original"))
+        fonte = _normalizar_texto_filtro(item.get("fonte"))
 
-        conteudo_insuficiente = (
+        conteudo_curto = (
             not resumo_original
-            and (
-                texto_original == titulo
-                or len(texto_original) < 120
-            )
+            and (texto_original == titulo or len(texto_original) < 120)
         )
 
-        if conteudo_insuficiente and not item.get("ncms_afetados"):
-            descartados += 1
-            continue
+        if conteudo_curto:
+            eh_receita_oficial = fonte == "receita_federal_rss"
+            titulo_tem_tema_forte = any(t in titulo for t in termos_fortes_titulo_oficial)
+            if not (eh_receita_oficial and titulo_tem_tema_forte):
+                descartados += 1
+                continue
 
         mantidos.append(item)
 
