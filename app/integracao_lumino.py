@@ -67,10 +67,36 @@ def _save_cache(data: dict) -> None:
 
 
 def _coletar_e_salvar(dias: int = 7) -> None:
+    """
+    Atualiza o Radar geral e, nesta fase, monitora automaticamente
+    os NCMs em uso na filial de Campinas (sp).
+    """
     try:
-        res = scraper.run(days=dias)
+        mapa_ncms = _buscar_ncms_usados("sp")
+        ncm_watchlist = sorted(mapa_ncms.keys())
+
+        log.info(
+            "Radar Tributário: iniciando coleta com %d NCMs monitorados de Campinas.",
+            len(ncm_watchlist),
+        )
+
+        res = scraper.run(
+            days=dias,
+            ncm_watchlist=ncm_watchlist,
+            ncm_days=30,
+        )
+
+        # Metadados úteis para diagnóstico e futuro frontend.
+        res["filial_monitorada"] = "sp"
+        res["ncms_monitorados"] = len(ncm_watchlist)
+
         _save_cache(res)
-        log.info("Cache do Radar Tributário atualizado: %d notícias", res.get("total", 0))
+
+        log.info(
+            "Cache do Radar Tributário atualizado: %d notícias | %d NCMs monitorados",
+            res.get("total", 0),
+            len(ncm_watchlist),
+        )
     except Exception:
         log.exception("Falha na coleta do Radar Tributário")
 
@@ -277,6 +303,8 @@ def atualizar_noticias(
     return {
         "status": "coleta_iniciada",
         "dias": dias,
+        "filial_monitorada": "sp",
+        "ncms_monitorados_cache": cache.get("ncms_monitorados", 0),
         "cache_atualizado_em": cache.get("gerado_em"),
         "cache_atual": cache.get("noticias", [])[:5],
     }
