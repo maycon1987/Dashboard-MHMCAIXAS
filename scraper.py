@@ -1,5 +1,5 @@
 """
-Lumina — Radar Tributário
+LÚMINO — Radar Tributário
 Scraper de notícias tributárias oficiais (RSS Receita Federal + DOU + Querido Diário)
 com classificação e resumo via LLM. Saída em JSON pronta para integração na API FastAPI.
 
@@ -40,7 +40,7 @@ QD_API = "https://api.queridodiario.ok.org.br/gazettes"
 DOU_API = "https://www.in.gov.br/consulta/-/buscar/dou"
 DOU_WEB = "https://www.in.gov.br/web/dou/-/"
 
-HEADERS = {"User-Agent": "Lumina Radar Tributario (+https://seusite.com; monitor de noticias publicas)",
+HEADERS = {"User-Agent": "LUMINO Radar Tributario (monitor de noticias publicas)",
            "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"}
 
 LLM_MODEL = "gpt-5-mini"  # barata e suficiente para resumo/classificação; trocar se quiser
@@ -204,12 +204,33 @@ def _batch(items: list[dict]) -> list[dict]:
         return items
 
     SYSTEM = (
-        "Você é o analista tributário do Lumina, sistema de gestão para empreendedores "
-        "e-commerces no Brasil (regime Simples Nacional, venda online, NCM de produtos). "
-        "Classifique e resuma notícias tributárias oficiais. Seja conservador: só marque "
-        "relevancia 'alta' se a notícia muda alíquota, cria obrigação nova, prazo ou regra "
-        "que afeta diretamente e-commerce/Simples Nacional. 'media' para mudanças setoriais "
-        "ou regionais. 'neutra' para licitações, notas técnicas internas, avisos gerais."
+        "Você é o analista tributário do LÚMINO. Analise notícias oficiais pensando em uma "
+        "empresa brasileira de COMÉRCIO DE MERCADORIAS e E-COMMERCE, atualmente optante pelo "
+        "Simples Nacional. O objetivo não é montar um feed tributário genérico, mas detectar "
+        "mudanças com potencial de afetar vendas, emissão fiscal, cadastro de produtos, preço, "
+        "margem, obrigações acessórias ou tributação de mercadorias. "
+
+        "REGRAS DE RELEVÂNCIA: "
+        "Marque 'alta' somente quando houver mudança concreta ou obrigação/prazo/regra com "
+        "efeito direto ou muito provável sobre comércio/e-commerce/Simples Nacional, especialmente "
+        "ICMS, ICMS-ST, DIFAL, FCP, IPI, PIS/COFINS, CBS, IBS, NCM, CEST, CFOP, NF-e, SPED, "
+        "documentos fiscais ou Reforma Tributária aplicável a empresas/comércio. "
+        "Marque 'media' quando a mudança puder afetar comércio/e-commerce, mas depender de setor, "
+        "produto, UF, vigência ou regulamentação complementar. "
+        "Marque 'neutra' quando o conteúdo não tiver efeito prático para comércio de mercadorias/e-commerce. "
+        "Devem ser neutras, salvo relação direta e explícita com a operação comercial: ITBI, IPTU, "
+        "previdência de servidor/ente público, contribuição atuarial, ISS de clínicas/profissões/serviços "
+        "alheios, licitações e contratos administrativos, obras públicas, tributos imobiliários locais "
+        "e alterações municipais sem relação com venda de mercadorias. "
+
+        "NCMs: preencha 'ncms_afetados' SOMENTE quando a própria notícia/norma mencionar um NCM "
+        "específico de 8 dígitos ou quando o texto trouxer uma classificação fiscal inequívoca que permita "
+        "identificar o NCM sem adivinhação. Normalize cada NCM para exatamente 8 dígitos, sem pontos. "
+        "NUNCA invente, estime ou deduza NCM apenas pelo setor, nome genérico de produto ou contexto. "
+        "Se não houver base explícita suficiente, retorne ncms_afetados como lista vazia. "
+
+        "No campo impacto, explique objetivamente o efeito empresarial. No resumo, descreva a mudança "
+        "sem extrapolar o texto oficial. Use tags curtas e úteis."
     )
     schema = {
         "type": "json_schema",
@@ -370,17 +391,61 @@ def dedupe(items: list[dict]) -> list[dict]:
 
 
 def filtrar_relevancia_pos_ia(items):
-    """Remove do Radar notícias classificadas pela IA como neutras."""
+    """
+    Remove notícias neutras e ruídos tributários sem relação prática
+    com comércio de mercadorias/e-commerce.
+    """
     mantidos = []
     descartados = 0
+
+    termos_ruido_forte = [
+        "itbi",
+        "iptu",
+        "previdência",
+        "previdencia",
+        "atuarial",
+        "terapia multidisciplinar",
+        "clínica",
+        "clinica",
+        "servidores",
+        "fundo em repartição",
+        "fundo em reparticao",
+    ]
+
+    termos_comercio = [
+        "icms", "icms-st", "substituição tributária", "substituicao tributaria",
+        "difal", "fcp", "ipi", "pis", "cofins", "cbs", "ibs", "ncm", "cest",
+        "cfop", "nf-e", "nota fiscal", "sped", "simples nacional",
+        "reforma tributária", "reforma tributaria", "mercadoria", "produto",
+        "comércio", "comercio", "e-commerce", "venda",
+    ]
+
     for item in items:
         relevancia = str(item.get("relevancia") or "").strip().lower()
         if relevancia == "neutra":
             descartados += 1
             continue
+
+        combinado = _normalizar_texto_filtro(
+            " ".join([
+                str(item.get("titulo") or ""),
+                str(item.get("resumo") or ""),
+                str(item.get("impacto") or ""),
+                " ".join(str(x) for x in item.get("tags", [])),
+            ])
+        )
+
+        tem_ruido_forte = any(t in combinado for t in termos_ruido_forte)
+        tem_contexto_comercio = any(t in combinado for t in termos_comercio)
+
+        if tem_ruido_forte and not tem_contexto_comercio:
+            descartados += 1
+            continue
+
         mantidos.append(item)
+
     log.info(
-        "Pós-filtro IA: %d mantidos, %d neutros descartados",
+        "Pós-filtro IA: %d mantidos, %d descartados",
         len(mantidos),
         descartados,
     )
