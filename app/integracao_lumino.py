@@ -111,19 +111,20 @@ def _supabase_headers() -> Dict[str, str]:
     }
 
 
-def _buscar_ncms_usados(filial: str) -> Set[str]:
+
+def _buscar_ncms_usados(filial: str) -> Dict[str, Dict[str, Any]]:
     """
-    Busca os NCMs reais da tabela public.produtos_tributarios.
-    Faz paginação para não depender do limite padrão do Supabase.
+    Busca os NCMs reais da tabela public.produtos_tributarios
+    e devolve um mapa com quantidade de produtos e exemplos.
     """
     filial = _normalizar_filial(filial)
-    ncms: Set[str] = set()
+    agrupado: Dict[str, Dict[str, Any]] = {}
     offset = 0
     page_size = 1000
 
     while True:
         params: Dict[str, Any] = {
-            "select": "ncm",
+            "select": "ncm,descricao,sku,codigo,ativo",
             "ncm": "not.is.null",
             "limit": page_size,
             "offset": offset,
@@ -153,15 +154,77 @@ def _buscar_ncms_usados(filial: str) -> Set[str]:
 
         for row in rows:
             ncm = _normalizar_ncm(row.get("ncm"))
-            if len(ncm) == 8:
-                ncms.add(ncm)
+            if len(ncm) != 8:
+                continue
+
+            item = agrupado.setdefault(
+                ncm,
+                {
+                    "ncm": ncm,
+                    "quantidade_produtos": 0,
+                    "produtos_ativos": 0,
+                    "exemplos_produtos": [],
+                },
+            )
+
+            item["quantidade_produtos"] += 1
+            if row.get("ativo") is not False:
+                item["produtos_ativos"] += 1
+
+            if len(item["exemplos_produtos"]) < 5:
+                item["exemplos_produtos"].append(
+                    {
+                        "descricao": row.get("descricao"),
+                        "sku": row.get("sku"),
+                        "codigo": row.get("codigo"),
+                    }
+                )
 
         if len(rows) < page_size:
             break
 
         offset += len(rows)
 
-    return ncms
+    return agrupado
+
+
+def _buscar_regras_por_ncms(ncms: Set[str]) -> Dict[str, int]:
+    """
+    Conta quantas regras tributárias ativas existem para cada NCM.
+    """
+    if not ncms:
+        return {}
+
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/tributacao_ncm",
+        headers=_supabase_headers(),
+        params={
+            "select": "ncm,id",
+            "ativo": "eq.true",
+            "ncm": f"in.({','.join(sorted(ncms))})",
+            "limit": 10000,
+        },
+        timeout=90,
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Erro ao consultar regras tributárias por NCM.",
+                "status_code": response.status_code,
+                "resposta": response.text[:1000],
+            },
+        )
+
+    resultado: Dict[str, int] = {}
+    rows = response.json() if response.text.strip() else []
+    for row in rows if isinstance(rows, list) else []:
+        ncm = _normalizar_ncm(row.get("ncm"))
+        if len(ncm) == 8:
+            resultado[ncm] = resultado.get(ncm, 0) + 1
+
+    return resultado
 
 
 @router.get("/tributario/noticias")
@@ -226,10 +289,13 @@ def alertas_ncm(
 ):
     """
     Cruza os NCMs citados nas notícias com os NCMs realmente usados
-    pelos produtos tributários da filial escolhida.
+    pelos produtos tributários da filial escolhida e mostra impacto
+    prático nos produtos da empresa.
     """
     filial_normalizada = _normalizar_filial(filial)
-    ncms_usados = _buscar_ncms_usados(filial_normalizada)
+    mapa_ncms = _buscar_ncms_usados(filial_normalizada)
+    ncms_usados = set(mapa_ncms.keys())
+    regras_por_ncm = _buscar_regras_por_ncms(ncms_usados)
 
     data = _load_cache()
     alertas = []
@@ -243,10 +309,42 @@ def alertas_ncm(
 
         correspondencias = sorted(ncms_noticia & ncms_usados)
 
-        if correspondencias:
-            item = dict(noticia)
-            item["ncms_em_uso_afetados"] = correspondencias
-            alertas.append(item)
+        if not correspondencias:
+            continue
+
+        impacto_ncms = []
+        total_produtos_afetados = 0
+
+        for ncm in correspondencias:
+            dados_ncm = mapa_ncms[ncm]
+            qtd_produtos = int(dados_ncm.get("produtos_ativos") or 0)
+            total_produtos_afetados += qtd_produtos
+
+            impacto_ncms.append(
+                {
+                    "ncm": ncm,
+                    "produtos_afetados": qtd_produtos,
+                    "regra_cadastrada": regras_por_ncm.get(ncm, 0) > 0,
+                    "quantidade_regras_ativas": regras_por_ncm.get(ncm, 0),
+                    "exemplos_produtos": dados_ncm.get("exemplos_produtos", []),
+                }
+            )
+
+        item = dict(noticia)
+        item["filial"] = filial_normalizada
+        item["ncms_em_uso_afetados"] = correspondencias
+        item["total_produtos_afetados"] = total_produtos_afetados
+        item["impacto_ncms"] = impacto_ncms
+        alertas.append(item)
+
+    peso_relevancia = {"alta": 3, "media": 2, "neutra": 1}
+    alertas.sort(
+        key=lambda item: (
+            peso_relevancia.get(str(item.get("relevancia", "")).lower(), 0),
+            int(item.get("total_produtos_afetados") or 0),
+        ),
+        reverse=True,
+    )
 
     return {
         "filial": filial_normalizada,
@@ -255,3 +353,4 @@ def alertas_ncm(
         "total_alertas": len(alertas),
         "alertas": alertas[:limit],
     }
+
