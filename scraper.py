@@ -40,7 +40,7 @@ QD_API = "https://api.queridodiario.ok.org.br/gazettes"
 DOU_API = "https://www.in.gov.br/consulta/-/buscar/dou"
 DOU_WEB = "https://www.in.gov.br/web/dou/-/"
 
-HEADERS = {"User-Agent": "LUMINO Radar Tributario (monitor de noticias publicas)",
+HEADERS = {"User-Agent": "LUMINO Radar Tributario (+https://seusite.com; monitor de noticias publicas)",
            "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"}
 
 LLM_MODEL = "gpt-5-mini"  # barata e suficiente para resumo/classificação; trocar se quiser
@@ -211,19 +211,29 @@ def _batch(items: list[dict]) -> list[dict]:
         "margem, obrigações acessórias ou tributação de mercadorias. "
 
         "REGRAS DE RELEVÂNCIA: "
-        "Marque 'alta' somente quando houver mudança concreta ou obrigação/prazo/regra com "
+        "Marque 'alta' somente quando houver mudança concreta, obrigação, prazo ou regra com "
         "efeito direto ou muito provável sobre comércio/e-commerce/Simples Nacional, especialmente "
         "ICMS, ICMS-ST, DIFAL, FCP, IPI, PIS/COFINS, CBS, IBS, NCM, CEST, CFOP, NF-e, SPED, "
         "documentos fiscais ou Reforma Tributária aplicável a empresas/comércio. "
         "Marque 'media' quando a mudança puder afetar comércio/e-commerce, mas depender de setor, "
         "produto, UF, vigência ou regulamentação complementar. "
         "Marque 'neutra' quando o conteúdo não tiver efeito prático para comércio de mercadorias/e-commerce. "
-        "Devem ser neutras, salvo relação direta e explícita com a operação comercial: ITBI, IPTU, "
-        "previdência de servidor/ente público, contribuição atuarial, ISS de clínicas/profissões/serviços "
-        "alheios, licitações e contratos administrativos, obras públicas, tributos imobiliários locais "
-        "e alterações municipais sem relação com venda de mercadorias. "
 
-        "NCMs: preencha 'ncms_afetados' SOMENTE quando a própria notícia/norma mencionar um NCM "
+        "LICITAÇÕES E COMPRAS PÚBLICAS: editais, licitações, pregões, habilitação, contratos "
+        "administrativos, PNCP e compras públicas devem ser SEMPRE classificados como 'neutra' "
+        "neste Radar geral, mesmo quando citarem Simples Nacional, retenção ou documentação fiscal. "
+
+        "Também devem ser neutras, salvo relação direta e explícita com a operação comercial: "
+        "ITBI, IPTU, previdência de servidor ou ente público, contribuição atuarial, ISS de clínicas, "
+        "profissões ou serviços alheios, obras públicas, tributos imobiliários locais e alterações "
+        "municipais sem relação com venda de mercadorias. "
+
+        "CONTEÚDO INSUFICIENTE: se o texto disponível for apenas um título, nome de página, nome de PDF "
+        "ou trecho curto demais para comprovar a mudança, NÃO invente detalhes de ICMS, CFOP, NF-e, ST, "
+        "prazo ou obrigação. Quando não houver base suficiente para um impacto empresarial objetivo, "
+        "classifique como 'neutra'. "
+
+        "NCMs: preencha 'ncms_afetados' SOMENTE quando a própria notícia ou norma mencionar um NCM "
         "específico de 8 dígitos ou quando o texto trouxer uma classificação fiscal inequívoca que permita "
         "identificar o NCM sem adivinhação. Normalize cada NCM para exatamente 8 dígitos, sem pontos. "
         "NUNCA invente, estime ou deduza NCM apenas pelo setor, nome genérico de produto ou contexto. "
@@ -398,6 +408,22 @@ def filtrar_relevancia_pos_ia(items):
     mantidos = []
     descartados = 0
 
+    termos_descartar_sempre = [
+        "licitação",
+        "licitacao",
+        "edital",
+        "pregão",
+        "pregao",
+        "contratação pública",
+        "contratacao publica",
+        "contrato administrativo",
+        "habilitação",
+        "habilitacao",
+        "pncp",
+        "compras públicas",
+        "compras publicas",
+    ]
+
     termos_ruido_forte = [
         "itbi",
         "iptu",
@@ -422,6 +448,7 @@ def filtrar_relevancia_pos_ia(items):
 
     for item in items:
         relevancia = str(item.get("relevancia") or "").strip().lower()
+
         if relevancia == "neutra":
             descartados += 1
             continue
@@ -429,16 +456,38 @@ def filtrar_relevancia_pos_ia(items):
         combinado = _normalizar_texto_filtro(
             " ".join([
                 str(item.get("titulo") or ""),
+                str(item.get("resumo_original") or ""),
+                str(item.get("texto_completo") or ""),
                 str(item.get("resumo") or ""),
                 str(item.get("impacto") or ""),
                 " ".join(str(x) for x in item.get("tags", [])),
             ])
         )
 
+        if any(t in combinado for t in termos_descartar_sempre):
+            descartados += 1
+            continue
+
         tem_ruido_forte = any(t in combinado for t in termos_ruido_forte)
         tem_contexto_comercio = any(t in combinado for t in termos_comercio)
 
         if tem_ruido_forte and not tem_contexto_comercio:
+            descartados += 1
+            continue
+
+        texto_original = _normalizar_texto_filtro(item.get("texto_completo"))
+        titulo = _normalizar_texto_filtro(item.get("titulo"))
+        resumo_original = _normalizar_texto_filtro(item.get("resumo_original"))
+
+        conteudo_insuficiente = (
+            not resumo_original
+            and (
+                texto_original == titulo
+                or len(texto_original) < 120
+            )
+        )
+
+        if conteudo_insuficiente and not item.get("ncms_afetados"):
             descartados += 1
             continue
 
