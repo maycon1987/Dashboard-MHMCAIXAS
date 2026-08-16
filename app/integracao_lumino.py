@@ -253,6 +253,30 @@ def _buscar_regras_por_ncms(ncms: Set[str]) -> Dict[str, int]:
     return resultado
 
 
+def _acao_recomendada_alerta(relevancia: str, total_produtos_afetados: int, impacto_ncms: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Gera orientação operacional conservadora; nunca altera regra fiscal automaticamente."""
+    sem_regra = sum(1 for item in impacto_ncms if not bool(item.get("regra_cadastrada")))
+    relevancia = str(relevancia or "").strip().lower()
+
+    if sem_regra > 0:
+        return {
+            "prioridade": "alta",
+            "status": "requer_analise",
+            "acao": f"Revisar {sem_regra} NCM(s) afetado(s) sem regra tributária ativa cadastrada antes de qualquer alteração fiscal.",
+        }
+    if relevancia == "alta" and total_produtos_afetados > 0:
+        return {
+            "prioridade": "alta",
+            "status": "requer_analise",
+            "acao": "Revisar a publicação e validar as regras tributárias dos produtos afetados antes da vigência ou de alterar cadastro/emissão fiscal.",
+        }
+    return {
+        "prioridade": "media",
+        "status": "monitorar",
+        "acao": "Monitorar a publicação e conferir se as regras tributárias cadastradas continuam válidas para os produtos afetados.",
+    }
+
+
 @router.get("/tributario/noticias")
 def listar_noticias(
     relevancia: str = Query(None, description="filtro: alta|media|neutra"),
@@ -348,12 +372,14 @@ def alertas_ncm(
             qtd_produtos = int(dados_ncm.get("produtos_ativos") or 0)
             total_produtos_afetados += qtd_produtos
 
+            regra_cadastrada = regras_por_ncm.get(ncm, 0) > 0
             impacto_ncms.append(
                 {
                     "ncm": ncm,
                     "produtos_afetados": qtd_produtos,
-                    "regra_cadastrada": regras_por_ncm.get(ncm, 0) > 0,
+                    "regra_cadastrada": regra_cadastrada,
                     "quantidade_regras_ativas": regras_por_ncm.get(ncm, 0),
+                    "status_regra": "cadastrada" if regra_cadastrada else "sem_regra",
                     "exemplos_produtos": dados_ncm.get("exemplos_produtos", []),
                 }
             )
@@ -363,6 +389,14 @@ def alertas_ncm(
         item["ncms_em_uso_afetados"] = correspondencias
         item["total_produtos_afetados"] = total_produtos_afetados
         item["impacto_ncms"] = impacto_ncms
+        recomendacao = _acao_recomendada_alerta(
+            item.get("relevancia", ""),
+            total_produtos_afetados,
+            impacto_ncms,
+        )
+        item["prioridade"] = recomendacao["prioridade"]
+        item["status_acao"] = recomendacao["status"]
+        item["acao_recomendada"] = recomendacao["acao"]
         alertas.append(item)
 
     peso_relevancia = {"alta": 3, "media": 2, "neutra": 1}
