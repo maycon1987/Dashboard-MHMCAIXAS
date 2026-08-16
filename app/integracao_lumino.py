@@ -44,6 +44,7 @@ SUPABASE_SERVICE_ROLE_KEY = (
     or os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 )
 TABELA_PRODUTOS = "produtos_tributarios"
+TABELA_CONFIG_TRIBUTARIA = "empresas_config_tributaria"
 
 
 def _load_cache() -> dict:
@@ -66,17 +67,24 @@ def _save_cache(data: dict) -> None:
     tmp_file.replace(CACHE_FILE)
 
 
-def _coletar_e_salvar(dias: int = 7) -> None:
-    """
-    Atualiza o Radar geral e, nesta fase, monitora automaticamente
-    os NCMs em uso na filial de Campinas (sp).
-    """
+def _coletar_e_salvar(dias: int = 7, empresa_id: str = "mhm_sp") -> None:
+    """Atualiza o Radar usando a configuração tributária da empresa solicitada."""
     try:
-        mapa_ncms = _buscar_ncms_usados("sp")
+        config = _buscar_config_empresa(empresa_id)
+        filial = _filial_por_empresa(config)
+
+        mapa_ncms: Dict[str, Dict[str, Any]] = {}
+        if bool(config.get("usa_ncm")):
+            mapa_ncms = _buscar_ncms_usados(filial)
+
         ncm_watchlist = sorted(mapa_ncms.keys())
 
         log.info(
-            "Radar Tributário: iniciando coleta com %d NCMs monitorados de Campinas.",
+            "Radar Tributário: empresa=%s | regime=%s | UF=%s | tipo=%s | %d NCMs monitorados.",
+            empresa_id,
+            config.get("regime_tributario"),
+            config.get("uf_origem"),
+            config.get("tipo_negocio"),
             len(ncm_watchlist),
         )
 
@@ -86,19 +94,81 @@ def _coletar_e_salvar(dias: int = 7) -> None:
             ncm_days=30,
         )
 
-        # Metadados úteis para diagnóstico e futuro frontend.
-        res["filial_monitorada"] = "sp"
+        res["empresa_id"] = empresa_id
+        res["nome_empresa"] = config.get("nome_empresa")
+        res["regime_tributario"] = config.get("regime_tributario")
+        res["uf_origem"] = config.get("uf_origem")
+        res["tipo_negocio"] = config.get("tipo_negocio")
+        res["filial_monitorada"] = filial
         res["ncms_monitorados"] = len(ncm_watchlist)
 
         _save_cache(res)
 
         log.info(
-            "Cache do Radar Tributário atualizado: %d notícias | %d NCMs monitorados",
+            "Cache do Radar atualizado: empresa=%s | %d notícias | %d NCMs monitorados",
+            empresa_id,
             res.get("total", 0),
             len(ncm_watchlist),
         )
     except Exception:
-        log.exception("Falha na coleta do Radar Tributário")
+        log.exception("Falha na coleta do Radar Tributário para empresa=%s", empresa_id)
+
+
+def _buscar_config_empresa(empresa_id: str) -> Dict[str, Any]:
+    """Carrega a configuração tributária ativa de uma empresa do LÚMINO."""
+    empresa_id = str(empresa_id or "").strip()
+    if not empresa_id:
+        raise HTTPException(status_code=422, detail="empresa_id é obrigatório")
+
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{TABELA_CONFIG_TRIBUTARIA}",
+        headers=_supabase_headers(),
+        params={
+            "select": "*",
+            "empresa_id": f"eq.{empresa_id}",
+            "ativo": "eq.true",
+            "limit": 1,
+        },
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "erro": "Erro ao consultar configuração tributária da empresa.",
+                "status_code": response.status_code,
+                "resposta": response.text[:1000],
+            },
+        )
+
+    rows = response.json() if response.text.strip() else []
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Configuração tributária ativa não encontrada para empresa_id={empresa_id}",
+        )
+
+    return rows[0]
+
+
+def _filial_por_empresa(config: Dict[str, Any]) -> str:
+    """
+    Compatibilidade temporária com produtos_tributarios.
+    Enquanto a tabela de produtos ainda usa filial sp/mg, mapeamos a empresa piloto.
+    Novas empresas deverão ter empresa_id também em produtos_tributarios.
+    """
+    empresa_id = str(config.get("empresa_id") or "").strip().lower()
+    if empresa_id == "mhm_sp":
+        return "sp"
+    if empresa_id == "mhm_mg":
+        return "mg"
+
+    filial = str(config.get("filial") or "").strip().lower()
+    if filial in {"sp", "mg", "all"}:
+        return filial
+
+    return "all"
 
 
 def _normalizar_filial(filial: str) -> str:
@@ -277,6 +347,14 @@ def _acao_recomendada_alerta(relevancia: str, total_produtos_afetados: int, impa
     }
 
 
+@router.get("/tributario/config")
+def obter_config_tributaria(
+    empresa_id: str = Query("mhm_sp", description="ID da empresa no LÚMINO"),
+):
+    """Retorna a configuração tributária ativa usada pelo Radar."""
+    return _buscar_config_empresa(empresa_id)
+
+
 @router.get("/tributario/noticias")
 def listar_noticias(
     relevancia: str = Query(None, description="filtro: alta|media|neutra"),
@@ -317,17 +395,23 @@ def noticias_recentes(n: int = Query(10, ge=1, le=50)):
 def atualizar_noticias(
     background_tasks: BackgroundTasks,
     dias: int = Query(7, ge=1, le=30),
+    empresa_id: str = Query("mhm_sp", description="ID da empresa no LÚMINO"),
 ):
     """
     Dispara a coleta em background e devolve imediatamente o cache atual.
     """
-    background_tasks.add_task(_coletar_e_salvar, dias)
+    config = _buscar_config_empresa(empresa_id)
+    background_tasks.add_task(_coletar_e_salvar, dias, empresa_id)
     cache = _load_cache()
 
     return {
         "status": "coleta_iniciada",
         "dias": dias,
-        "filial_monitorada": "sp",
+        "empresa_id": empresa_id,
+        "nome_empresa": config.get("nome_empresa"),
+        "regime_tributario": config.get("regime_tributario"),
+        "uf_origem": config.get("uf_origem"),
+        "tipo_negocio": config.get("tipo_negocio"),
         "ncms_monitorados_cache": cache.get("ncms_monitorados", 0),
         "cache_atualizado_em": cache.get("gerado_em"),
         "cache_atual": cache.get("noticias", [])[:5],
