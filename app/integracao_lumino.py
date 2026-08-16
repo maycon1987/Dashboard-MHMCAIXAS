@@ -4,7 +4,7 @@ Integração do Radar Tributário na API FastAPI do LÚMINO (MHM Dashboard Tiny 
 Arquivo adaptado para o projeto atual:
 - usa o scraper.py do Radar Tributário;
 - cruza alertas com a tabela real public.produtos_tributarios do Supabase;
-- suporta filial sp, mg e all;
+- suporta múltiplas empresas por empresa_id e filtro opcional de filial;
 - não inicia APScheduler automaticamente;
 - mantém cache local noticias.json nesta primeira etapa.
 
@@ -29,7 +29,6 @@ router = APIRouter(tags=["Tributário"])
 log = logging.getLogger("lumino-noticias")
 
 DATA_DIR = Path(__file__).parent
-CACHE_FILE = DATA_DIR / "noticias.json"
 DEFAULT_CACHE = {
     "gerado_em": "",
     "periodo_dias": 0,
@@ -47,35 +46,58 @@ TABELA_PRODUTOS = "produtos_tributarios"
 TABELA_CONFIG_TRIBUTARIA = "empresas_config_tributaria"
 
 
-def _load_cache() -> dict:
-    if not CACHE_FILE.exists():
-        return DEFAULT_CACHE.copy()
+
+def _cache_file(empresa_id: str) -> Path:
+    """
+    Cache separado por empresa para evitar que um cliente sobrescreva
+    as notícias de outro cliente no ambiente SaaS.
+    """
+    seguro = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(empresa_id or "default").strip())
+    return DATA_DIR / f"noticias_{seguro}.json"
+
+
+def _load_cache(empresa_id: str = "mhm_sp") -> dict:
+    cache_file = _cache_file(empresa_id)
+
+    if not cache_file.exists():
+        base = DEFAULT_CACHE.copy()
+        base["empresa_id"] = empresa_id
+        return base
 
     try:
-        with open(CACHE_FILE, encoding="utf-8") as f:
+        with open(cache_file, encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else DEFAULT_CACHE.copy()
+        if isinstance(data, dict):
+            return data
+
+        base = DEFAULT_CACHE.copy()
+        base["empresa_id"] = empresa_id
+        return base
     except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Não foi possível ler o cache de notícias: %s", exc)
-        return DEFAULT_CACHE.copy()
+        log.warning("Não foi possível ler o cache de notícias da empresa %s: %s", empresa_id, exc)
+        base = DEFAULT_CACHE.copy()
+        base["empresa_id"] = empresa_id
+        return base
 
 
-def _save_cache(data: dict) -> None:
-    tmp_file = CACHE_FILE.with_suffix(".json.tmp")
+def _save_cache(data: dict, empresa_id: str) -> None:
+    cache_file = _cache_file(empresa_id)
+    tmp_file = cache_file.with_suffix(".json.tmp")
+
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    tmp_file.replace(CACHE_FILE)
+
+    tmp_file.replace(cache_file)
 
 
 def _coletar_e_salvar(dias: int = 7, empresa_id: str = "mhm_sp") -> None:
     """Atualiza o Radar usando a configuração tributária da empresa solicitada."""
     try:
         config = _buscar_config_empresa(empresa_id)
-        filial = _filial_por_empresa(config)
 
         mapa_ncms: Dict[str, Dict[str, Any]] = {}
         if bool(config.get("usa_ncm")):
-            mapa_ncms = _buscar_ncms_usados(filial)
+            mapa_ncms = _buscar_ncms_usados(empresa_id=empresa_id)
 
         ncm_watchlist = sorted(mapa_ncms.keys())
 
@@ -99,10 +121,9 @@ def _coletar_e_salvar(dias: int = 7, empresa_id: str = "mhm_sp") -> None:
         res["regime_tributario"] = config.get("regime_tributario")
         res["uf_origem"] = config.get("uf_origem")
         res["tipo_negocio"] = config.get("tipo_negocio")
-        res["filial_monitorada"] = filial
         res["ncms_monitorados"] = len(ncm_watchlist)
 
-        _save_cache(res)
+        _save_cache(res, empresa_id)
 
         log.info(
             "Cache do Radar atualizado: empresa=%s | %d notícias | %d NCMs monitorados",
@@ -154,9 +175,8 @@ def _buscar_config_empresa(empresa_id: str) -> Dict[str, Any]:
 
 def _filial_por_empresa(config: Dict[str, Any]) -> str:
     """
-    Compatibilidade temporária com produtos_tributarios.
-    Enquanto a tabela de produtos ainda usa filial sp/mg, mapeamos a empresa piloto.
-    Novas empresas deverão ter empresa_id também em produtos_tributarios.
+    Compatibilidade legada com telas antigas que ainda trabalham com filial.
+    O Radar SaaS não depende mais desta função para localizar produtos.
     """
     empresa_id = str(config.get("empresa_id") or "").strip().lower()
     if empresa_id == "mhm_sp":
@@ -208,26 +228,38 @@ def _supabase_headers() -> Dict[str, str]:
 
 
 
-def _buscar_ncms_usados(filial: str) -> Dict[str, Dict[str, Any]]:
+
+def _buscar_ncms_usados(
+    empresa_id: str,
+    filial: str | None = None,
+) -> Dict[str, Dict[str, Any]]:
     """
-    Busca os NCMs reais da tabela public.produtos_tributarios
-    e devolve um mapa com quantidade de produtos e exemplos.
+    Busca os NCMs reais de uma empresa em public.produtos_tributarios.
+
+    empresa_id é a identidade principal do cliente no SaaS.
+    filial é opcional e serve apenas para recortar uma unidade interna.
     """
-    filial = _normalizar_filial(filial)
+    empresa_id = str(empresa_id or "").strip()
+    if not empresa_id:
+        raise HTTPException(status_code=422, detail="empresa_id é obrigatório")
+
     agrupado: Dict[str, Dict[str, Any]] = {}
     offset = 0
     page_size = 1000
 
     while True:
         params: Dict[str, Any] = {
-            "select": "ncm,descricao,sku,codigo,ativo",
+            "select": "empresa_id,filial,ncm,descricao,sku,codigo,ativo",
+            "empresa_id": f"eq.{empresa_id}",
             "ncm": "not.is.null",
             "limit": page_size,
             "offset": offset,
         }
 
-        if filial != "all":
-            params["filial"] = f"eq.{filial}"
+        if filial:
+            filial_normalizada = _normalizar_filial(filial)
+            if filial_normalizada != "all":
+                params["filial"] = f"eq.{filial_normalizada}"
 
         response = requests.get(
             f"{SUPABASE_URL}/rest/v1/{TABELA_PRODUTOS}",
@@ -240,7 +272,8 @@ def _buscar_ncms_usados(filial: str) -> Dict[str, Dict[str, Any]]:
             raise HTTPException(
                 status_code=500,
                 detail={
-                    "erro": "Erro ao consultar NCMs dos produtos tributários.",
+                    "erro": "Erro ao consultar NCMs dos produtos tributários da empresa.",
+                    "empresa_id": empresa_id,
                     "status_code": response.status_code,
                     "resposta": response.text[:1000],
                 },
@@ -259,13 +292,18 @@ def _buscar_ncms_usados(filial: str) -> Dict[str, Dict[str, Any]]:
                     "ncm": ncm,
                     "quantidade_produtos": 0,
                     "produtos_ativos": 0,
+                    "filiais_encontradas": set(),
                     "exemplos_produtos": [],
                 },
             )
 
             item["quantidade_produtos"] += 1
+
             if row.get("ativo") is not False:
                 item["produtos_ativos"] += 1
+
+            if row.get("filial"):
+                item["filiais_encontradas"].add(str(row.get("filial")))
 
             if len(item["exemplos_produtos"]) < 5:
                 item["exemplos_produtos"].append(
@@ -273,6 +311,7 @@ def _buscar_ncms_usados(filial: str) -> Dict[str, Dict[str, Any]]:
                         "descricao": row.get("descricao"),
                         "sku": row.get("sku"),
                         "codigo": row.get("codigo"),
+                        "filial": row.get("filial"),
                     }
                 )
 
@@ -280,6 +319,10 @@ def _buscar_ncms_usados(filial: str) -> Dict[str, Dict[str, Any]]:
             break
 
         offset += len(rows)
+
+    # set não é serializável em JSON.
+    for item in agrupado.values():
+        item["filiais_encontradas"] = sorted(item["filiais_encontradas"])
 
     return agrupado
 
@@ -357,10 +400,12 @@ def obter_config_tributaria(
 
 @router.get("/tributario/noticias")
 def listar_noticias(
+    empresa_id: str = Query("mhm_sp", description="ID da empresa no LÚMINO"),
     relevancia: str = Query(None, description="filtro: alta|media|neutra"),
     limit: int = Query(20, ge=1, le=100),
 ):
-    data = _load_cache()
+    _buscar_config_empresa(empresa_id)
+    data = _load_cache(empresa_id)
     noticias = data.get("noticias", [])
 
     if relevancia:
@@ -383,8 +428,12 @@ def listar_noticias(
 
 
 @router.get("/tributario/noticias/recentes")
-def noticias_recentes(n: int = Query(10, ge=1, le=50)):
-    data = _load_cache()
+def noticias_recentes(
+    empresa_id: str = Query("mhm_sp", description="ID da empresa no LÚMINO"),
+    n: int = Query(10, ge=1, le=50),
+):
+    _buscar_config_empresa(empresa_id)
+    data = _load_cache(empresa_id)
     return {
         "atualizado_em": data.get("gerado_em"),
         "noticias": data.get("noticias", [])[:n],
@@ -402,7 +451,7 @@ def atualizar_noticias(
     """
     config = _buscar_config_empresa(empresa_id)
     background_tasks.add_task(_coletar_e_salvar, dias, empresa_id)
-    cache = _load_cache()
+    cache = _load_cache(empresa_id)
 
     return {
         "status": "coleta_iniciada",
@@ -420,20 +469,24 @@ def atualizar_noticias(
 
 @router.get("/tributario/ncms-alertas")
 def alertas_ncm(
-    filial: str = Query("sp", description="sp, mg ou all"),
+    empresa_id: str = Query("mhm_sp", description="ID da empresa no LÚMINO"),
+    filial: str | None = Query(None, description="Opcional: filtrar unidade sp, mg ou all"),
     limit: int = Query(100, ge=1, le=500),
 ):
     """
-    Cruza os NCMs citados nas notícias com os NCMs realmente usados
-    pelos produtos tributários da filial escolhida e mostra impacto
-    prático nos produtos da empresa.
+    Cruza NCMs citados nas notícias com produtos da empresa.
+    empresa_id é a identidade principal; filial é apenas um filtro opcional.
     """
-    filial_normalizada = _normalizar_filial(filial)
-    mapa_ncms = _buscar_ncms_usados(filial_normalizada)
+    config = _buscar_config_empresa(empresa_id)
+
+    mapa_ncms = _buscar_ncms_usados(
+        empresa_id=empresa_id,
+        filial=filial,
+    )
     ncms_usados = set(mapa_ncms.keys())
     regras_por_ncm = _buscar_regras_por_ncms(ncms_usados)
 
-    data = _load_cache()
+    data = _load_cache(empresa_id)
     alertas = []
 
     for noticia in data.get("noticias", []):
@@ -457,6 +510,7 @@ def alertas_ncm(
             total_produtos_afetados += qtd_produtos
 
             regra_cadastrada = regras_por_ncm.get(ncm, 0) > 0
+
             impacto_ncms.append(
                 {
                     "ncm": ncm,
@@ -464,23 +518,29 @@ def alertas_ncm(
                     "regra_cadastrada": regra_cadastrada,
                     "quantidade_regras_ativas": regras_por_ncm.get(ncm, 0),
                     "status_regra": "cadastrada" if regra_cadastrada else "sem_regra",
+                    "filiais_encontradas": dados_ncm.get("filiais_encontradas", []),
                     "exemplos_produtos": dados_ncm.get("exemplos_produtos", []),
                 }
             )
 
         item = dict(noticia)
-        item["filial"] = filial_normalizada
+        item["empresa_id"] = empresa_id
+        item["nome_empresa"] = config.get("nome_empresa")
+        item["filial_filtro"] = filial
         item["ncms_em_uso_afetados"] = correspondencias
         item["total_produtos_afetados"] = total_produtos_afetados
         item["impacto_ncms"] = impacto_ncms
+
         recomendacao = _acao_recomendada_alerta(
             item.get("relevancia", ""),
             total_produtos_afetados,
             impacto_ncms,
         )
+
         item["prioridade"] = recomendacao["prioridade"]
         item["status_acao"] = recomendacao["status"]
         item["acao_recomendada"] = recomendacao["acao"]
+
         alertas.append(item)
 
     peso_relevancia = {"alta": 3, "media": 2, "neutra": 1}
@@ -493,7 +553,9 @@ def alertas_ncm(
     )
 
     return {
-        "filial": filial_normalizada,
+        "empresa_id": empresa_id,
+        "nome_empresa": config.get("nome_empresa"),
+        "filial_filtro": filial,
         "atualizado_em": data.get("gerado_em"),
         "ncms_monitorados": len(ncms_usados),
         "total_alertas": len(alertas),
